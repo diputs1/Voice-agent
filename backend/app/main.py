@@ -6,7 +6,7 @@ import uuid
 from collections.abc import AsyncIterator
 
 import httpx
-from fastapi import BackgroundTasks, FastAPI, HTTPException
+from fastapi import BackgroundTasks, Depends, FastAPI, Header, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 
@@ -35,6 +35,7 @@ app.add_middleware(
 @app.on_event("startup")
 async def startup() -> None:
     app.state.settings = settings
+    app.state.kb_status = {"provider": "unknown", "fallback": False, "fallback_reason": None}
     app.state.kb = await _build_knowledge_base(settings)
     app.state.agent_graph = SafariAgentGraph(app.state.kb, settings)
     app.state.firecrawl_client = (
@@ -46,8 +47,13 @@ async def startup() -> None:
 
 
 @app.get("/health")
-async def health() -> dict[str, str]:
-    return {"status": "ok"}
+async def health() -> dict[str, object]:
+    kb_status = getattr(
+        app.state,
+        "kb_status",
+        {"provider": "unknown", "fallback": False, "fallback_reason": None},
+    )
+    return {"status": "degraded" if kb_status.get("fallback") else "ok", "kb": kb_status}
 
 
 @app.post("/voice/stt-token")
@@ -139,7 +145,18 @@ async def chat_stream(payload: ChatRequest) -> StreamingResponse:
     return StreamingResponse(sse(), media_type="text/event-stream")
 
 
-@app.post("/admin/ingest-vinwonders")
+async def require_admin_api_key(x_admin_api_key: str | None = Header(default=None)) -> None:
+    configured_key = settings.admin_api_key
+    if configured_key:
+        if x_admin_api_key != configured_key:
+            raise HTTPException(status_code=401, detail="Invalid admin API key")
+        return
+
+    if settings.app_env.lower() not in {"development", "dev", "test", "testing", "local"}:
+        raise HTTPException(status_code=500, detail="ADMIN_API_KEY is not configured")
+
+
+@app.post("/admin/ingest-vinwonders", dependencies=[Depends(require_admin_api_key)])
 async def ingest_vinwonders(payload: IngestRequest | None = None) -> dict[str, int | str]:
     url = payload.url if payload and payload.url else settings.vinwonders_source_url
     if app.state.firecrawl_client:
@@ -169,7 +186,7 @@ async def ingest_vinwonders(payload: IngestRequest | None = None) -> dict[str, i
     }
 
 
-@app.post("/admin/crawl", response_model=CrawlJobResponse)
+@app.post("/admin/crawl", response_model=CrawlJobResponse, dependencies=[Depends(require_admin_api_key)])
 async def crawl(payload: CrawlRequest, background_tasks: BackgroundTasks) -> CrawlJobResponse:
     if not app.state.firecrawl_client:
         raise HTTPException(status_code=501, detail="FIRECRAWL_API_KEY is not configured")
@@ -196,7 +213,7 @@ async def crawl(payload: CrawlRequest, background_tasks: BackgroundTasks) -> Cra
     return CrawlJobResponse(job_id=job_id, status="queued", url=str(payload.url))
 
 
-@app.get("/admin/crawl-jobs/{job_id}")
+@app.get("/admin/crawl-jobs/{job_id}", dependencies=[Depends(require_admin_api_key)])
 async def get_crawl_job(job_id: str) -> dict[str, object]:
     job = app.state.crawl_jobs.get(job_id)
     if not job:
@@ -214,11 +231,24 @@ async def _build_knowledge_base(settings: Settings) -> KnowledgeBase:
     postgres = PostgresKnowledgeBase(settings.database_url, embeddings)
     try:
         await postgres.ensure_ready()
+        app.state.kb_status = {"provider": "postgres", "fallback": False, "fallback_reason": None}
         return postgres
     except Exception as exc:
+        if not settings.allow_kb_fallback:
+            app.state.kb_status = {
+                "provider": "postgres",
+                "fallback": False,
+                "fallback_reason": str(exc),
+            }
+            raise
         logger.warning("Falling back to in-memory knowledge base: %s", exc)
         memory = InMemoryKnowledgeBase(embeddings)
         await memory.ensure_ready()
+        app.state.kb_status = {
+            "provider": "memory",
+            "fallback": True,
+            "fallback_reason": str(exc),
+        }
         return memory
 
 

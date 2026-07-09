@@ -19,6 +19,9 @@ class Settings(BaseSettings):
     elevenlabs_tts_model: str = "eleven_multilingual_v2"
     vinwonders_source_url: str = "https://vinwonders.com/vi/vinpearl-safari-phu-quoc/"
     cors_origins: str = Field(default="http://localhost:3000")
+    low_confidence_threshold: float = Field(default=0.30, ge=0.0, le=1.0)
+    allow_kb_fallback: bool = True
+    admin_api_key: str | None = None
 
     @property
     def cors_origin_list(self) -> list[str]:

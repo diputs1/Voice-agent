@@ -3,7 +3,7 @@ import pytest
 from app.agents.graph import SafariAgentGraph
 from app.config import Settings
 from app.embeddings import EmbeddingProvider
-from app.kb import InMemoryKnowledgeBase
+from app.kb import InMemoryKnowledgeBase, KnowledgeHit
 
 
 @pytest.mark.asyncio
@@ -103,6 +103,108 @@ async def test_grounded_quantitative_answer_passes():
 
     assert result["handoff_required"] is False
     assert result["answer"] == "Công viên mở cửa từ 09:00 đến 16:00."
+
+
+@pytest.mark.asyncio
+async def test_follow_up_without_history_uses_original_query():
+    settings = Settings(openai_api_key=None)
+    kb = RecordingKnowledgeBase(EmbeddingProvider(None, "text-embedding-3-small"))
+    await kb.ensure_ready()
+    graph = SafariAgentGraph(kb, settings)
+
+    result = await graph.ainvoke({"transcript": "Thế còn giá vé trẻ em thì sao?"}, "empty-thread")
+
+    assert result["search_query"] == "Thế còn giá vé trẻ em thì sao?"
+    assert result["rewrite_source"] == "original"
+    assert kb.last_query == "Thế còn giá vé trẻ em thì sao?"
+
+
+@pytest.mark.asyncio
+async def test_follow_up_uses_heuristic_rewrite_when_llm_is_unavailable():
+    settings = Settings(openai_api_key=None)
+    kb = RecordingKnowledgeBase(EmbeddingProvider(None, "text-embedding-3-small"))
+    await kb.ensure_ready()
+    await kb.save_thread_turn(
+        "rewrite-thread",
+        "Tôi muốn hỏi về giá vé Vinpearl Safari Phú Quốc",
+        "Bạn nên kiểm tra website chính thức.",
+    )
+    graph = SafariAgentGraph(kb, settings)
+
+    result = await graph.ainvoke({"transcript": "thế còn giá vé trẻ em thì sao?"}, "rewrite-thread")
+
+    assert result["rewrite_source"] == "heuristic"
+    assert "Tôi muốn hỏi về giá vé Vinpearl Safari Phú Quốc" in result["search_query"]
+    assert "thế còn giá vé trẻ em thì sao?" in result["search_query"]
+    assert kb.last_query == result["search_query"]
+
+
+@pytest.mark.asyncio
+async def test_follow_up_uses_llm_rewrite_when_available():
+    settings = Settings(openai_api_key=None)
+    kb = RecordingKnowledgeBase(EmbeddingProvider(None, "text-embedding-3-small"))
+    await kb.ensure_ready()
+    await kb.save_thread_turn(
+        "llm-rewrite-thread",
+        "Tôi muốn hỏi về giá vé Vinpearl Safari Phú Quốc",
+        "Bạn nên kiểm tra website chính thức.",
+    )
+    graph = SafariAgentGraph(kb, settings)
+    graph.llm = FakeLLM(
+        [
+            '{"search_query":"Giá vé trẻ em Vinpearl Safari Phú Quốc"}',
+            "Bạn nên kiểm tra giá vé trẻ em trên website chính thức.",
+        ]
+    )
+
+    result = await graph.ainvoke({"transcript": "thế còn trẻ em thì sao?"}, "llm-rewrite-thread")
+
+    assert result["rewrite_source"] == "llm"
+    assert result["search_query"] == "Giá vé trẻ em Vinpearl Safari Phú Quốc"
+    assert kb.last_query == "Giá vé trẻ em Vinpearl Safari Phú Quốc"
+
+
+@pytest.mark.asyncio
+async def test_low_confidence_threshold_is_configurable():
+    settings = Settings(openai_api_key=None, low_confidence_threshold=0.95)
+    kb = LowConfidenceKnowledgeBase(EmbeddingProvider(None, "text-embedding-3-small"))
+    await kb.ensure_ready()
+    graph = SafariAgentGraph(kb, settings)
+
+    result = await graph.ainvoke({"transcript": "Có khu vực gửi hành lý không?"}, "low-confidence-thread")
+
+    assert result["handoff_required"] is True
+    assert result["handoff_reason"] == "low_confidence"
+    assert result["recommended_action"] == "check_official_site"
+
+
+class RecordingKnowledgeBase(InMemoryKnowledgeBase):
+    def __init__(self, embeddings: EmbeddingProvider) -> None:
+        super().__init__(embeddings)
+        self.last_query = ""
+
+    async def search(self, query: str, limit: int = 5):
+        self.last_query = query
+        return await super().search(query, limit)
+
+
+class LowConfidenceKnowledgeBase(InMemoryKnowledgeBase):
+    async def search(self, query: str, limit: int = 5):
+        return [
+            KnowledgeHit(
+                id="low-score",
+                title="Vinpearl Safari Phú Quốc",
+                section="Dịch vụ",
+                category="service",
+                content="Trong khuôn viên có các dịch vụ hỗ trợ khách tham quan.",
+                source_url="https://vinwonders.com/vi/vinpearl-safari-phu-quoc/",
+                language="vi",
+                crawled_at=None,
+                valid_until=None,
+                metadata={},
+                score=0.1,
+            )
+        ]
 
 
 class FakeResponse:
