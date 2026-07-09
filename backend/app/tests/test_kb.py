@@ -1,4 +1,10 @@
-from app.kb import _adjusted_score, _diversify_categories
+import pytest
+
+from app.embeddings import EmbeddingProvider
+from app.ingestion import IngestedChunk
+from app.kb import InMemoryKnowledgeBase, _adjusted_score, _diversify_categories, _normalize_text, _rrf_fuse
+
+from datetime import UTC, datetime
 
 
 def test_safari_price_chunk_beats_off_topic_price_chunk():
@@ -56,3 +62,55 @@ def test_diversify_categories_does_not_duplicate_extra_picks():
     ids = [row["id"] for _, row in picked]
 
     assert ids == ["price-1", "offer-1", "price-2"]
+
+
+def test_normalize_text_strips_vietnamese_diacritics():
+    assert _normalize_text("Cầu Hôn Phú Quốc") == "cau hon phu quoc"
+
+
+def test_rrf_fuse_deduplicates_and_preserves_confidence_score():
+    row = {"id": "same", "title": "Cầu Hôn", "score": 0.2}
+    fused = _rrf_fuse(
+        [(0.9, {"id": "vector-only", "score": 0.9}, 0.9), (0.2, row, 0.2)],
+        [(2.0, row, 0.2)],
+        limit=10,
+    )
+
+    ids = [item[1]["id"] for item in fused]
+
+    assert ids.count("same") == 1
+    assert next(item[1] for item in fused if item[1]["id"] == "same")["score"] == 0.2
+
+
+@pytest.mark.asyncio
+async def test_in_memory_hybrid_search_matches_unaccented_exact_keyword():
+    kb = InMemoryKnowledgeBase(EmbeddingProvider(None, "text-embedding-3-small"))
+    now = datetime.now(UTC)
+    await kb.upsert_chunks(
+        [
+            IngestedChunk(
+                title="Cầu Hôn Phú Quốc",
+                section="Điểm tham quan",
+                category="experience",
+                content="Thông tin về Cầu Hôn gần khu vực Phú Quốc.",
+                source_url="https://vinwonders.com/vi/wonderpedia/news/cau-hon-phu-quoc/",
+                content_hash="cau-hon",
+                crawled_at=now,
+                valid_until=None,
+            ),
+            IngestedChunk(
+                title="Ẩm thực Nha Trang",
+                section="Combo",
+                category="offer",
+                content="Ưu đãi ẩm thực tại Nha Trang.",
+                source_url="https://vinwonders.com/vi/uu-dai/nha-trang/",
+                content_hash="nha-trang",
+                crawled_at=now,
+                valid_until=None,
+            ),
+        ]
+    )
+
+    hits = await kb.search("cau hon", limit=2)
+
+    assert hits[0].id == "cau-hon"

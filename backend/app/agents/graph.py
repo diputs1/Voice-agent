@@ -10,6 +10,7 @@ from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_openai import ChatOpenAI
 from langgraph.checkpoint.memory import MemorySaver
 from langgraph.graph import END, START, StateGraph
+from langsmith import traceable
 
 from app.config import Settings
 from app.kb import KnowledgeBase, KnowledgeHit
@@ -72,6 +73,33 @@ LLM_CLASSIFIER_HINTS = {
     "gói nào",
     "budget",
     "cost",
+}
+SMALL_TALK_KEYWORDS = {
+    "xin chào",
+    "chào",
+    "hello",
+    "hi",
+    "cảm ơn",
+    "cam on",
+    "thanks",
+    "thank you",
+}
+OUT_OF_SCOPE_KEYWORDS = {
+    "thời tiết",
+    "weather",
+    "bóng đá",
+    "football",
+    "chứng khoán",
+    "stock",
+    "bitcoin",
+    "khách sạn nha trang",
+    "vinwonders nha trang",
+    "grand world",
+    "ocean city",
+    "hà nội",
+    "ha noi",
+    "vũ yên",
+    "vu yen",
 }
 HANDOFF_ACTIONS = {
     "stale_or_missing_time_sensitive_data": "contact_hotline_or_booking",
@@ -142,8 +170,17 @@ class SafariAgentGraph:
     ) -> AsyncIterator[tuple[str, SafariState, SafariState]]:
         state = await self._with_thread_history(state, thread_id)
         current: SafariState = dict(state)
+        update = await self._supervisor_node(current)
+        current.update(update)
+        yield "supervisor", update, current
+
+        if self._route_after_supervisor(current) == "direct":
+            update = await self._direct_response_node(current)
+            current.update(update)
+            yield "direct_response", update, current
+            return
+
         for node_name, node in (
-            ("supervisor", self._supervisor_node),
             ("safari_knowledge", self._safari_knowledge_node),
             ("offer_freshness", self._offer_freshness_node),
         ):
@@ -157,6 +194,9 @@ class SafariAgentGraph:
             yield "escalation", update, current
 
     async def astream_voice_answer_tokens(self, state: SafariState) -> AsyncIterator[str]:
+        if state.get("answer") and state.get("route") == "direct_response":
+            yield state["answer"]
+            return
         if state.get("answer") and state.get("handoff_required"):
             yield state["answer"]
             return
@@ -188,13 +228,19 @@ class SafariAgentGraph:
     def _build_graph(self):
         graph = StateGraph(SafariState)
         graph.add_node("supervisor", self._supervisor_node)
+        graph.add_node("direct_response", self._direct_response_node)
         graph.add_node("safari_knowledge", self._safari_knowledge_node)
         graph.add_node("offer_freshness", self._offer_freshness_node)
         graph.add_node("escalation", self._escalation_node)
         graph.add_node("voice_answer", self._voice_answer_node)
 
         graph.add_edge(START, "supervisor")
-        graph.add_edge("supervisor", "safari_knowledge")
+        graph.add_conditional_edges(
+            "supervisor",
+            self._route_after_supervisor,
+            {"direct": "direct_response", "knowledge": "safari_knowledge"},
+        )
+        graph.add_edge("direct_response", END)
         graph.add_edge("safari_knowledge", "offer_freshness")
         graph.add_conditional_edges(
             "offer_freshness",
@@ -206,6 +252,7 @@ class SafariAgentGraph:
 
         return graph.compile(checkpointer=MemorySaver())
 
+    @traceable(name="graph.supervisor")
     async def _supervisor_node(self, state: SafariState) -> SafariState:
         transcript = state.get("transcript", "")
         intent, confidence, source = await self._classify_intent(transcript)
@@ -220,11 +267,16 @@ class SafariAgentGraph:
             "search_query": search_query,
             "rewrite_source": rewrite_source,
             "messages": [{"role": "user", "content": transcript}],
-            "route": "safari_knowledge",
+            "route": "direct_response" if intent in {"small_talk", "out_of_scope"} else "safari_knowledge",
         }
 
+    @traceable(name="graph.classify_intent")
     async def _classify_intent(self, transcript: str) -> tuple[str, float, str]:
         lowered = transcript.lower()
+        if _is_small_talk(lowered):
+            return "small_talk", 1.0, "rules"
+        if _is_out_of_scope(lowered):
+            return "out_of_scope", 1.0, "rules"
         if any(k in lowered for k in TIME_SENSITIVE_KEYWORDS):
             return "time_sensitive", 1.0, "rules"
         if not any(k in lowered for k in LLM_CLASSIFIER_HINTS):
@@ -239,10 +291,12 @@ class SafariAgentGraph:
                         content=(
                             "Phân loại câu hỏi cho Vinpearl Safari Phú Quốc. "
                             "Trả về JSON hợp lệ duy nhất: "
-                            '{"intent":"time_sensitive|stable","confidence":0.0}. '
+                            '{"intent":"time_sensitive|stable|small_talk|out_of_scope","confidence":0.0}. '
                             "time_sensitive nếu câu hỏi phụ thuộc dữ liệu có thể đổi như giá, vé, "
                             "ưu đãi, voucher, combo, booking, lịch theo ngày, hôm nay, ngày mai, "
-                            "cuối tuần, dịp lễ, còn áp dụng hay mới nhất."
+                            "cuối tuần, dịp lễ, còn áp dụng hay mới nhất. "
+                            "small_talk nếu chỉ chào hỏi/cảm ơn. out_of_scope nếu không liên quan "
+                            "Vinpearl Safari Phú Quốc."
                         )
                     ),
                     HumanMessage(content=transcript),
@@ -253,6 +307,7 @@ class SafariAgentGraph:
         except Exception:
             return "stable", 0.0, "llm_failed"
 
+    @traceable(name="graph.safari_knowledge")
     async def _safari_knowledge_node(self, state: SafariState) -> SafariState:
         hits = await self.kb.search(state.get("search_query") or state.get("transcript", ""), limit=5)
         citations = [_citation(hit) for hit in hits]
@@ -263,6 +318,7 @@ class SafariAgentGraph:
             "confidence": float(confidence),
         }
 
+    @traceable(name="graph.offer_freshness")
     async def _offer_freshness_node(self, state: SafariState) -> SafariState:
         now = datetime.now(UTC)
         handoff_required = False
@@ -287,9 +343,11 @@ class SafariAgentGraph:
             "recommended_action": HANDOFF_ACTIONS.get(handoff_reason),
         }
 
+    @traceable(name="graph.escalation")
     async def _escalation_node(self, state: SafariState) -> SafariState:
         return _handoff_state(state, state.get("handoff_reason") or "stale_or_missing_time_sensitive_data")
 
+    @traceable(name="graph.voice_answer")
     async def _voice_answer_node(self, state: SafariState) -> SafariState:
         if state.get("answer") and state.get("handoff_required"):
             return state
@@ -302,6 +360,29 @@ class SafariAgentGraph:
             answer = _fallback_answer(transcript, state.get("retrieved_context", []))
 
         return self.finalize_streamed_answer(state, answer)
+
+    @traceable(name="graph.direct_response")
+    async def _direct_response_node(self, state: SafariState) -> SafariState:
+        intent = state.get("intent")
+        if intent == "small_talk":
+            answer = (
+                "Xin chào! Mình có thể hỗ trợ các câu hỏi về Vinpearl Safari Phú Quốc "
+                "như giờ mở cửa, trải nghiệm, show, dịch vụ hoặc thông tin cần xác nhận."
+            )
+        else:
+            answer = (
+                "Mình chỉ hỗ trợ thông tin liên quan đến Vinpearl Safari Phú Quốc. "
+                "Bạn có thể hỏi về lịch hoạt động, trải nghiệm, dịch vụ trong công viên "
+                "hoặc kiểm tra nguồn VinWonders chính thức cho thông tin ngoài phạm vi này."
+            )
+        return {
+            "answer": answer,
+            "citations": [],
+            "confidence": 1.0,
+            "handoff_required": False,
+            "handoff_reason": None,
+            "recommended_action": None,
+        }
 
     def _voice_answer_messages(self, state: SafariState):
         context = "\n\n".join(
@@ -322,12 +403,16 @@ class SafariAgentGraph:
     def _route_after_freshness(self, state: SafariState) -> Literal["escalate", "answer"]:
         return "escalate" if state.get("handoff_required") else "answer"
 
+    def _route_after_supervisor(self, state: SafariState) -> Literal["direct", "knowledge"]:
+        return "direct" if state.get("intent") in {"small_talk", "out_of_scope"} else "knowledge"
+
     async def _with_thread_history(self, state: SafariState, thread_id: str) -> SafariState:
         if state.get("thread_history") is not None:
             return state
         history = await self.kb.get_thread(thread_id)
         return {**state, "thread_history": history[-4:]}
 
+    @traceable(name="graph.resolve_search_query")
     async def _resolve_search_query(
         self,
         transcript: str,
@@ -377,10 +462,21 @@ def _parse_classifier_payload(content: str) -> dict[str, float | str]:
         stripped = re.sub(r"^```(?:json)?\s*|\s*```$", "", stripped, flags=re.IGNORECASE)
     payload = json.loads(stripped)
     intent = payload.get("intent")
-    if intent not in {"time_sensitive", "stable"}:
+    if intent not in {"time_sensitive", "stable", "small_talk", "out_of_scope"}:
         raise ValueError(f"Unsupported classifier intent: {intent}")
     confidence = float(payload.get("confidence", 0.0))
     return {"intent": intent, "confidence": max(0.0, min(1.0, confidence))}
+
+
+def _is_small_talk(lowered: str) -> bool:
+    stripped = lowered.strip(" !?.")
+    return any(stripped == keyword or stripped.startswith(f"{keyword} ") for keyword in SMALL_TALK_KEYWORDS)
+
+
+def _is_out_of_scope(lowered: str) -> bool:
+    if any(anchor in lowered for anchor in DOMAIN_ANCHORS):
+        return False
+    return any(keyword in lowered for keyword in OUT_OF_SCOPE_KEYWORDS)
 
 
 def _parse_rewrite_payload(content: str) -> str:
