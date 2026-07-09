@@ -22,6 +22,9 @@ class Settings(BaseSettings):
     low_confidence_threshold: float = Field(default=0.70, ge=0.0, le=1.0)
     allow_kb_fallback: bool = True
     admin_api_key: str | None = None
+    agent_max_concurrency: int = Field(default=8, ge=1)
+    qa_cache_ttl_seconds: int = Field(default=300, ge=0)
+    qa_cache_max_entries: int = Field(default=256, ge=1)
 
     @property
     def cors_origin_list(self) -> list[str]:

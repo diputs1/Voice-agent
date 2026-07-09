@@ -1,16 +1,24 @@
+import asyncio
+import json
+from types import SimpleNamespace
+
 import pytest
 from fastapi import BackgroundTasks
 from fastapi import HTTPException
 
 from app import main
+from app.cache import TTLQACache
+from app.routers import admin, chat, health
 from app.schemas import CrawlRequest
+from app.services.chat_service import ChatService
+from app.services.ingestion_service import IngestionService
 
 
 @pytest.mark.asyncio
 async def test_health_reports_ok_for_primary_kb():
     main.app.state.kb_status = {"provider": "postgres", "fallback": False, "fallback_reason": None}
 
-    response = await main.health()
+    response = await health.health(_request())
 
     assert response["status"] == "ok"
     assert response["kb"]["provider"] == "postgres"
@@ -25,7 +33,7 @@ async def test_health_reports_degraded_for_kb_fallback():
         "fallback_reason": "connection failed",
     }
 
-    response = await main.health()
+    response = await health.health(_request())
 
     assert response["status"] == "degraded"
     assert response["kb"]["provider"] == "memory"
@@ -36,33 +44,36 @@ async def test_health_reports_degraded_for_kb_fallback():
 async def test_admin_auth_allows_dev_when_key_is_unset(monkeypatch):
     monkeypatch.setattr(main.settings, "app_env", "development")
     monkeypatch.setattr(main.settings, "admin_api_key", None)
+    main.app.state.settings = main.settings
 
-    await main.require_admin_api_key()
+    await admin.require_admin_api_key(_request())
 
 
 @pytest.mark.asyncio
 async def test_admin_auth_rejects_missing_or_wrong_key_when_configured(monkeypatch):
     monkeypatch.setattr(main.settings, "app_env", "development")
     monkeypatch.setattr(main.settings, "admin_api_key", "secret-admin-key")
+    main.app.state.settings = main.settings
 
     with pytest.raises(HTTPException) as missing:
-        await main.require_admin_api_key()
+        await admin.require_admin_api_key(_request())
     assert missing.value.status_code == 401
 
     with pytest.raises(HTTPException) as wrong:
-        await main.require_admin_api_key("wrong")
+        await admin.require_admin_api_key(_request(), "wrong")
     assert wrong.value.status_code == 401
 
-    await main.require_admin_api_key("secret-admin-key")
+    await admin.require_admin_api_key(_request(), "secret-admin-key")
 
 
 @pytest.mark.asyncio
 async def test_admin_auth_fails_closed_outside_dev_when_key_is_unset(monkeypatch):
     monkeypatch.setattr(main.settings, "app_env", "production")
     monkeypatch.setattr(main.settings, "admin_api_key", None)
+    main.app.state.settings = main.settings
 
     with pytest.raises(HTTPException) as exc:
-        await main.require_admin_api_key()
+        await admin.require_admin_api_key(_request())
 
     assert exc.value.status_code == 500
     assert "ADMIN_API_KEY" in exc.value.detail
@@ -71,10 +82,14 @@ async def test_admin_auth_fails_closed_outside_dev_when_key_is_unset(monkeypatch
 @pytest.mark.asyncio
 async def test_crawl_creates_queued_job_in_store(monkeypatch):
     store = FakeCrawlJobStore()
-    main.app.state.crawl_job_store = store
-    main.app.state.firecrawl_client = object()
+    service = IngestionService(
+        settings=main.settings,
+        kb=FakeKnowledgeBase(),
+        crawl_job_store=store,
+        firecrawl_client=object(),
+    )
 
-    response = await main.crawl(
+    response = await service.crawl(
         CrawlRequest(url="https://vinwonders.com/vi/vinpearl-safari-phu-quoc/"),
         BackgroundTasks(),
     )
@@ -87,12 +102,45 @@ async def test_crawl_creates_queued_job_in_store(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_get_crawl_job_returns_404_for_missing_store_job():
-    main.app.state.crawl_job_store = FakeCrawlJobStore()
+    service = IngestionService(
+        settings=main.settings,
+        kb=FakeKnowledgeBase(),
+        crawl_job_store=FakeCrawlJobStore(),
+        firecrawl_client=object(),
+    )
 
     with pytest.raises(HTTPException) as exc:
-        await main.get_crawl_job("missing")
+        await service.get_crawl_job("missing")
 
     assert exc.value.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_chat_stream_uses_cached_answer_after_contextualized_query():
+    graph = FakeAgentGraph()
+    kb = FakeKnowledgeBase()
+    main.app.state.chat_service = ChatService(
+        agent_graph=graph,
+        kb=kb,
+        agent_semaphore=asyncio.Semaphore(1),
+        qa_cache=TTLQACache(ttl_seconds=60, max_entries=8),
+    )
+
+    first = await _collect_sse_events(
+        await chat.chat_stream(_request(), _chat_request("Mở cửa mấy giờ?"))
+    )
+    second = await _collect_sse_events(
+        await chat.chat_stream(_request(), _chat_request("Mở cửa mấy giờ?"))
+    )
+
+    assert first[-1]["payload"]["cache_hit"] is False
+    assert second[-1]["payload"]["cache_hit"] is True
+    assert graph.voice_calls == 1
+    assert graph.completed_pre_answer_calls == 1
+    assert kb.saved_turns == [
+        ("test-thread", "Mở cửa mấy giờ?", "Câu trả lời từ graph."),
+        ("test-thread", "Mở cửa mấy giờ?", "Câu trả lời từ graph."),
+    ]
 
 
 class FakeCrawlJobStore:
@@ -108,3 +156,72 @@ class FakeCrawlJobStore:
 
     async def get(self, job_id):
         return self.jobs.get(job_id)
+
+
+class FakeKnowledgeBase:
+    def __init__(self) -> None:
+        self.saved_turns = []
+
+    async def doc_set_hash(self):
+        return "docs-v1"
+
+    async def save_thread_turn(self, thread_id, transcript, answer):
+        self.saved_turns.append((thread_id, transcript, answer))
+
+
+class FakeAgentGraph:
+    def __init__(self) -> None:
+        self.voice_calls = 0
+        self.completed_pre_answer_calls = 0
+
+    async def astream_pre_answer(self, state, thread_id):
+        del thread_id
+        current = {
+            **state,
+            "search_query": "Vinpearl Safari mở cửa mấy giờ?",
+            "confidence": 0.9,
+            "citations": [],
+            "handoff_required": False,
+        }
+        yield "contextualize_query", {"search_query": current["search_query"]}, current
+        self.completed_pre_answer_calls += 1
+
+    async def astream_voice_answer_tokens(self, state):
+        del state
+        self.voice_calls += 1
+        yield "Câu trả lời từ graph."
+
+    def finalize_streamed_answer(self, state, answer):
+        return {
+            **state,
+            "answer": answer,
+            "citations": [],
+            "confidence": 0.9,
+            "handoff_required": False,
+            "handoff_reason": None,
+            "recommended_action": None,
+        }
+
+
+def _chat_request(transcript):
+    from app.schemas import ChatRequest
+
+    return ChatRequest(transcript=transcript, thread_id="test-thread")
+
+
+async def _collect_sse_events(response):
+    body = ""
+    async for chunk in response.body_iterator:
+        body += chunk.decode() if isinstance(chunk, bytes) else chunk
+
+    events = []
+    for raw_event in body.strip().split("\n\n"):
+        lines = raw_event.splitlines()
+        event = lines[0].removeprefix("event: ")
+        payload = json.loads(lines[1].removeprefix("data: "))
+        events.append({"event": event, "payload": payload})
+    return events
+
+
+def _request():
+    return SimpleNamespace(app=main.app)

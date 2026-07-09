@@ -65,6 +65,16 @@ LANGSMITH_API_KEY=...
 LANGSMITH_PROJECT=vin-agent
 ```
 
+Runtime controls for production traffic:
+
+```bash
+AGENT_MAX_CONCURRENCY=8
+QA_CACHE_TTL_SECONDS=300
+QA_CACHE_MAX_ENTRIES=256
+```
+
+`AGENT_MAX_CONCURRENCY` limits concurrent `/chat/stream` agent runs per backend process. QA cache keys use the contextualized query plus the current KB document-set hash, so cached answers expire by TTL and naturally miss after ingestion changes the KB.
+
 ## Firecrawl ingestion
 
 Start a clean web crawl and ingest the returned Markdown into the KB:

@@ -377,7 +377,7 @@ def _is_footer_or_related_heading(lowered_line: str) -> bool:
 def _is_language_switcher_line(line: str) -> bool:
     return bool(
         re.fullmatch(
-            r"-?\s*\[(Tiếng Việt|English|中文 \(中国\)|한국어|Русский)\]\(https://vinwonders\.com/[^)]+\)",
+            r"-?\s*\[(Tiếng Việt|English)\]\(https://vinwonders\.com/[^)]+\)",
             line,
         )
     )
