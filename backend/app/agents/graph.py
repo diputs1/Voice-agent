@@ -19,6 +19,9 @@ from app.prompts import load_prompt
 class SafariState(TypedDict, total=False):
     messages: list[dict[str, str]]
     transcript: str
+    thread_history: list[dict[str, Any]]
+    search_query: str
+    rewrite_source: str
     intent: str
     retrieved_context: list[dict[str, Any]]
     answer: str
@@ -75,6 +78,32 @@ HANDOFF_ACTIONS = {
     "low_confidence": "check_official_site",
     "ungrounded_answer": "contact_hotline_or_booking",
 }
+FOLLOW_UP_MARKERS = {
+    "thế còn",
+    "vậy còn",
+    "còn ",
+    "thì sao",
+    "nó",
+    "đó",
+    "cái này",
+    "cái đó",
+    "ở đó",
+    "chỗ đó",
+    "như vậy",
+    "trẻ em",
+    "người lớn",
+    "người già",
+    "vé đó",
+    "show đó",
+    "dịch vụ đó",
+}
+DOMAIN_ANCHORS = {
+    "vinpearl",
+    "vinwonders",
+    "safari",
+    "phú quốc",
+    "phu quoc",
+}
 
 
 class SafariAgentGraph:
@@ -93,12 +122,14 @@ class SafariAgentGraph:
         self.graph = self._build_graph()
 
     async def ainvoke(self, state: SafariState, thread_id: str) -> SafariState:
+        state = await self._with_thread_history(state, thread_id)
         return await self.graph.ainvoke(
             state,
             config={"configurable": {"thread_id": thread_id}},
         )
 
     async def astream_updates(self, state: SafariState, thread_id: str):
+        state = await self._with_thread_history(state, thread_id)
         async for event in self.graph.astream(
             state,
             config={"configurable": {"thread_id": thread_id}},
@@ -109,7 +140,7 @@ class SafariAgentGraph:
     async def astream_pre_answer(
         self, state: SafariState, thread_id: str
     ) -> AsyncIterator[tuple[str, SafariState, SafariState]]:
-        del thread_id
+        state = await self._with_thread_history(state, thread_id)
         current: SafariState = dict(state)
         for node_name, node in (
             ("supervisor", self._supervisor_node),
@@ -178,10 +209,16 @@ class SafariAgentGraph:
     async def _supervisor_node(self, state: SafariState) -> SafariState:
         transcript = state.get("transcript", "")
         intent, confidence, source = await self._classify_intent(transcript)
+        search_query, rewrite_source = await self._resolve_search_query(
+            transcript,
+            state.get("thread_history", []),
+        )
         return {
             "intent": intent,
             "classifier_confidence": confidence,
             "classifier_source": source,
+            "search_query": search_query,
+            "rewrite_source": rewrite_source,
             "messages": [{"role": "user", "content": transcript}],
             "route": "safari_knowledge",
         }
@@ -217,7 +254,7 @@ class SafariAgentGraph:
             return "stable", 0.0, "llm_failed"
 
     async def _safari_knowledge_node(self, state: SafariState) -> SafariState:
-        hits = await self.kb.search(state.get("transcript", ""), limit=5)
+        hits = await self.kb.search(state.get("search_query") or state.get("transcript", ""), limit=5)
         citations = [_citation(hit) for hit in hits]
         confidence = max((hit.score for hit in hits), default=0.0)
         return {
@@ -241,7 +278,7 @@ class SafariAgentGraph:
                     handoff_required = False
                     handoff_reason = None
                     break
-        if state.get("confidence", 0.0) < 0.05:
+        if state.get("confidence", 0.0) < self.settings.low_confidence_threshold:
             handoff_required = True
             handoff_reason = "low_confidence"
         return {
@@ -285,6 +322,54 @@ class SafariAgentGraph:
     def _route_after_freshness(self, state: SafariState) -> Literal["escalate", "answer"]:
         return "escalate" if state.get("handoff_required") else "answer"
 
+    async def _with_thread_history(self, state: SafariState, thread_id: str) -> SafariState:
+        if state.get("thread_history") is not None:
+            return state
+        history = await self.kb.get_thread(thread_id)
+        return {**state, "thread_history": history[-4:]}
+
+    async def _resolve_search_query(
+        self,
+        transcript: str,
+        history: list[dict[str, Any]],
+    ) -> tuple[str, str]:
+        if not history:
+            return transcript, "original"
+        if not _looks_like_follow_up(transcript):
+            return transcript, "original"
+
+        if self.llm:
+            try:
+                response = await self.llm.ainvoke(
+                    [
+                        SystemMessage(
+                            content=(
+                                "Viết lại câu hỏi follow-up của người dùng thành một câu hỏi "
+                                "độc lập để truy xuất knowledge base Vinpearl Safari Phú Quốc. "
+                                "Giữ nguyên ý định, ngôn ngữ tiếng Việt và các thực thể quan trọng. "
+                                "Chỉ trả JSON hợp lệ: "
+                                '{"search_query":"câu hỏi độc lập"}'
+                            )
+                        ),
+                        HumanMessage(
+                            content=(
+                                f"Lịch sử gần nhất:\n{_history_context(history)}\n\n"
+                                f"Câu hỏi mới: {transcript}"
+                            )
+                        ),
+                    ]
+                )
+                rewritten = _parse_rewrite_payload(str(response.content))
+                if rewritten:
+                    return rewritten, "llm"
+            except Exception:
+                pass
+
+        fallback = _heuristic_rewrite(transcript, history)
+        if fallback != transcript:
+            return fallback, "heuristic"
+        return transcript, "original"
+
 
 def _parse_classifier_payload(content: str) -> dict[str, float | str]:
     stripped = content.strip()
@@ -296,6 +381,58 @@ def _parse_classifier_payload(content: str) -> dict[str, float | str]:
         raise ValueError(f"Unsupported classifier intent: {intent}")
     confidence = float(payload.get("confidence", 0.0))
     return {"intent": intent, "confidence": max(0.0, min(1.0, confidence))}
+
+
+def _parse_rewrite_payload(content: str) -> str:
+    stripped = content.strip()
+    if stripped.startswith("```"):
+        stripped = re.sub(r"^```(?:json)?\s*|\s*```$", "", stripped, flags=re.IGNORECASE)
+    try:
+        payload = json.loads(stripped)
+        return str(payload.get("search_query") or "").strip()
+    except json.JSONDecodeError:
+        return stripped
+
+
+def _looks_like_follow_up(transcript: str) -> bool:
+    lowered = transcript.lower().strip()
+    if any(marker in lowered for marker in FOLLOW_UP_MARKERS):
+        return True
+    if "?" in lowered and len(lowered.split()) <= 8 and not any(
+        anchor in lowered for anchor in DOMAIN_ANCHORS
+    ):
+        return True
+    return False
+
+
+def _history_context(history: list[dict[str, Any]]) -> str:
+    turns = history[-3:]
+    lines = []
+    for idx, turn in enumerate(turns, start=1):
+        transcript = str(turn.get("transcript") or "").strip()
+        answer = str(turn.get("answer") or "").strip()
+        if transcript:
+            lines.append(f"Lượt {idx} - người dùng: {transcript}")
+        if answer:
+            lines.append(f"Lượt {idx} - trợ lý: {answer[:500]}")
+    return "\n".join(lines) or "Không có lịch sử."
+
+
+def _heuristic_rewrite(transcript: str, history: list[dict[str, Any]]) -> str:
+    previous = _latest_transcript(history)
+    if not previous:
+        return transcript
+    if any(anchor in transcript.lower() for anchor in DOMAIN_ANCHORS):
+        return transcript
+    return f"{previous}. Câu hỏi tiếp theo: {transcript}"
+
+
+def _latest_transcript(history: list[dict[str, Any]]) -> str:
+    for turn in reversed(history):
+        transcript = str(turn.get("transcript") or "").strip()
+        if transcript:
+            return transcript
+    return ""
 
 
 def _message_content_to_text(content: Any) -> str:
