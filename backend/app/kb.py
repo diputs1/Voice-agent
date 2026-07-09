@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import re
 import unicodedata
+from hashlib import sha256
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
 from typing import Protocol
@@ -40,6 +41,34 @@ class KnowledgeBase(Protocol):
     async def save_thread_turn(self, thread_id: str, transcript: str, answer: str) -> None: ...
 
     async def get_thread(self, thread_id: str) -> list[dict]: ...
+
+    async def doc_set_hash(self) -> str: ...
+
+
+class Retriever(Protocol):
+    async def search(self, query: str, limit: int = 5) -> list[KnowledgeHit]: ...
+
+
+class IngestionSink(Protocol):
+    async def upsert_chunks(self, chunks: list[IngestedChunk]) -> int: ...
+
+
+class ThreadStore(Protocol):
+    async def save_thread_turn(self, thread_id: str, transcript: str, answer: str) -> None: ...
+
+    async def get_thread(self, thread_id: str) -> list[dict]: ...
+
+
+class DocSetHasher(Protocol):
+    async def doc_set_hash(self) -> str: ...
+
+
+class AgentKnowledgeBase(Retriever, ThreadStore, Protocol):
+    pass
+
+
+class ChatKnowledgeStore(ThreadStore, DocSetHasher, Protocol):
+    pass
 
 
 class InMemoryKnowledgeBase:
@@ -106,6 +135,10 @@ class InMemoryKnowledgeBase:
 
     async def get_thread(self, thread_id: str) -> list[dict]:
         return self.threads.get(thread_id, [])
+
+    async def doc_set_hash(self) -> str:
+        content_hashes = sorted(str(row.get("content_hash") or row.get("id") or "") for row in self.rows)
+        return sha256("|".join(content_hashes).encode("utf-8")).hexdigest()
 
 
 class PostgresKnowledgeBase:
@@ -263,6 +296,16 @@ class PostgresKnowledgeBase:
                     (thread_id,),
                 ).fetchall()
             )
+
+    async def doc_set_hash(self) -> str:
+        with psycopg.connect(self.database_url) as conn:
+            value = conn.execute(
+                """
+                SELECT md5(coalesce(string_agg(content_hash, ',' ORDER BY content_hash), ''))
+                FROM documents
+                """
+            ).fetchone()[0]
+        return str(value)
 
     def _backfill_search_text(self, conn) -> None:
         with conn.cursor(row_factory=dict_row) as cur:
