@@ -1,0 +1,21 @@
+services:
+  postgres:
+    image: pgvector/pgvector:pg16
+    container_name: vin-agent-postgres
+    environment:
+      POSTGRES_DB: vin_agent
+      POSTGRES_USER: vin_agent
+      POSTGRES_PASSWORD: vin_agent
+    ports:
+      - "5432:5432"
+    volumes:
+      - vin_agent_postgres:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U vin_agent -d vin_agent"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+volumes:
+  vin_agent_postgres:
+
