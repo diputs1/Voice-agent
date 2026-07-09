@@ -1,0 +1,34 @@
+[
+  {
+    "id": "schedule_basic",
+    "transcript": "Vinpearl Safari mở cửa mấy giờ?",
+    "expected_intent": "stable",
+    "expected_handoff": false,
+    "required_substrings": ["09:00", "16:00"],
+    "requires_citations": true
+  },
+  {
+    "id": "price_time_sensitive",
+    "transcript": "Giá vé hôm nay bao nhiêu?",
+    "expected_intent": "time_sensitive",
+    "expected_handoff": true,
+    "required_substrings": ["kiểm tra"],
+    "requires_citations": false
+  },
+  {
+    "id": "small_talk_direct",
+    "transcript": "Xin chào",
+    "expected_intent": "small_talk",
+    "expected_handoff": false,
+    "required_substrings": ["Vinpearl Safari Phú Quốc"],
+    "requires_citations": false
+  },
+  {
+    "id": "out_of_scope_direct",
+    "transcript": "Thời tiết Hà Nội hôm nay thế nào?",
+    "expected_intent": "out_of_scope",
+    "expected_handoff": false,
+    "required_substrings": ["chỉ hỗ trợ"],
+    "requires_citations": false
+  }
+]

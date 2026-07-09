@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 import json
+import re
+import unicodedata
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
 from typing import Protocol
 
 import psycopg
 from psycopg.rows import dict_row
+from langsmith import traceable
 
 from app.embeddings import EmbeddingProvider, pgvector_literal
 from app.ingestion import IngestedChunk, seed_chunks
@@ -56,18 +59,25 @@ class InMemoryKnowledgeBase:
         for chunk, vector in zip(chunks, vectors, strict=True):
             if chunk.content_hash in existing_hashes:
                 continue
-            self.rows.append({**asdict(chunk), "embedding": vector, "id": chunk.content_hash})
+            row = {**asdict(chunk), "embedding": vector, "id": chunk.content_hash}
+            row["search_text"] = _search_text(row)
+            self.rows.append(row)
             inserted += 1
         return inserted
 
+    @traceable(name="kb.in_memory_search")
     async def search(self, query: str, limit: int = 5) -> list[KnowledgeHit]:
         query_vector = await self.embeddings.embed_query(query)
-        scored = []
+        vector_ranked = []
+        lexical_ranked = []
         for row in self.rows:
-            score = _adjusted_score(query, row, _cosine(query_vector, row["embedding"]))
-            scored.append((score, row))
-        scored.sort(key=lambda item: item[0], reverse=True)
-        scored = _diversify_categories(query, scored, limit)
+            confidence = _adjusted_score(query, row, _cosine(query_vector, row["embedding"]))
+            lexical = _lexical_score(query, row)
+            vector_ranked.append((confidence, row, confidence))
+            if lexical > 0:
+                lexical_ranked.append((lexical, row, confidence))
+        fused = _rrf_fuse(vector_ranked, lexical_ranked, limit=max(limit * 6, 20))
+        scored = _diversify_categories(query, fused, limit)
         return [
             KnowledgeHit(
                 id=row["id"],
@@ -80,9 +90,9 @@ class InMemoryKnowledgeBase:
                 crawled_at=_iso(row["crawled_at"]),
                 valid_until=_iso(row["valid_until"]),
                 metadata=row.get("metadata") or {},
-                score=score,
+                score=float(row.get("score") or 0.0),
             )
-            for score, row in scored[:limit]
+            for _, row in scored[:limit]
         ]
 
     async def save_thread_turn(self, thread_id: str, transcript: str, answer: str) -> None:
@@ -124,6 +134,14 @@ class PostgresKnowledgeBase:
                 )
                 """
             )
+            conn.execute("ALTER TABLE documents ADD COLUMN IF NOT EXISTS search_text TEXT NOT NULL DEFAULT ''")
+            conn.execute(
+                """
+                ALTER TABLE documents
+                ADD COLUMN IF NOT EXISTS search_vector tsvector
+                GENERATED ALWAYS AS (to_tsvector('simple', search_text)) STORED
+                """
+            )
             conn.execute(
                 """
                 CREATE TABLE IF NOT EXISTS thread_turns (
@@ -141,6 +159,10 @@ class PostgresKnowledgeBase:
             conn.execute(
                 "CREATE INDEX IF NOT EXISTS documents_metadata_idx ON documents USING gin (metadata)"
             )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS documents_search_vector_idx ON documents USING gin (search_vector)"
+            )
+            self._backfill_search_text(conn)
 
     async def upsert_chunks(self, chunks: list[IngestedChunk]) -> int:
         vectors = await self.embeddings.embed_documents([chunk.content for chunk in chunks])
@@ -151,9 +173,9 @@ class PostgresKnowledgeBase:
                     """
                     INSERT INTO documents (
                       source_url, title, section, category, content, content_hash,
-                      language, crawled_at, valid_until, metadata, embedding
+                      language, crawled_at, valid_until, metadata, embedding, search_text
                     )
-                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb, %s::vector)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb, %s::vector, %s)
                     ON CONFLICT (content_hash) DO NOTHING
                     RETURNING id
                     """,
@@ -169,16 +191,19 @@ class PostgresKnowledgeBase:
                         chunk.valid_until,
                         json.dumps(_metadata_for(chunk), ensure_ascii=False),
                         pgvector_literal(vector),
+                        _search_text(asdict(chunk)),
                     ),
                 ).fetchone()
                 if result:
                     inserted += 1
         return inserted
 
+    @traceable(name="kb.postgres_search")
     async def search(self, query: str, limit: int = 5) -> list[KnowledgeHit]:
         vector = await self.embeddings.embed_query(query)
+        query_text = _normalize_text(query)
         with psycopg.connect(self.database_url, row_factory=dict_row) as conn:
-            rows = conn.execute(
+            vector_rows = conn.execute(
                 """
                 SELECT id::text, title, section, category, content, source_url, language,
                        crawled_at::text, valid_until::text, metadata,
@@ -189,14 +214,34 @@ class PostgresKnowledgeBase:
                 """,
                 (pgvector_literal(vector), pgvector_literal(vector), max(limit * 6, 20)),
             ).fetchall()
-        reranked_pairs = []
-        for row in rows:
+            lexical_rows = []
+            if query_text:
+                lexical_rows = conn.execute(
+                    """
+                    SELECT id::text, title, section, category, content, source_url, language,
+                           crawled_at::text, valid_until::text, metadata,
+                           ts_rank_cd(search_vector, websearch_to_tsquery('simple', %s)) AS lexical_score,
+                           1 - (embedding <=> %s::vector) AS score
+                    FROM documents
+                    WHERE search_vector @@ websearch_to_tsquery('simple', %s)
+                    ORDER BY lexical_score DESC
+                    LIMIT %s
+                    """,
+                    (query_text, pgvector_literal(vector), query_text, max(limit * 6, 20)),
+                ).fetchall()
+        vector_ranked = []
+        for row in vector_rows:
             item = dict(row)
-            item["score"] = _adjusted_score(query, item, float(item["score"]))
-            reranked_pairs.append((float(item["score"]), item))
-        reranked_pairs.sort(key=lambda item: item[0], reverse=True)
-        reranked = [row for _, row in _diversify_categories(query, reranked_pairs, limit)]
-        return [KnowledgeHit(**row) for row in reranked[:limit]]
+            confidence = _adjusted_score(query, item, float(item["score"]))
+            vector_ranked.append((confidence, item, confidence))
+        lexical_ranked = []
+        for row in lexical_rows:
+            item = dict(row)
+            confidence = _adjusted_score(query, item, float(item["score"]))
+            lexical_ranked.append((float(item["lexical_score"]), item, confidence))
+        fused = _rrf_fuse(vector_ranked, lexical_ranked, limit=max(limit * 6, 20))
+        reranked = [row for _, row in _diversify_categories(query, fused, limit)]
+        return [_knowledge_hit_from_row(row) for row in reranked[:limit]]
 
     async def save_thread_turn(self, thread_id: str, transcript: str, answer: str) -> None:
         with psycopg.connect(self.database_url, autocommit=True) as conn:
@@ -219,9 +264,108 @@ class PostgresKnowledgeBase:
                 ).fetchall()
             )
 
+    def _backfill_search_text(self, conn) -> None:
+        with conn.cursor(row_factory=dict_row) as cur:
+            rows = cur.execute(
+                """
+                SELECT id::text, title, section, category, content, source_url, language, metadata
+                FROM documents
+                WHERE search_text = ''
+                """
+            ).fetchall()
+        for row in rows:
+            conn.execute(
+                "UPDATE documents SET search_text = %s WHERE id = %s::uuid",
+                (_search_text(dict(row)), row["id"]),
+            )
+
 
 def _cosine(left: list[float], right: list[float]) -> float:
     return sum(a * b for a, b in zip(left, right, strict=True))
+
+
+def _knowledge_hit_from_row(row: dict) -> KnowledgeHit:
+    return KnowledgeHit(
+        id=str(row["id"]),
+        title=row["title"],
+        section=row["section"],
+        category=row["category"],
+        content=row["content"],
+        source_url=row["source_url"],
+        language=row["language"],
+        crawled_at=row["crawled_at"],
+        valid_until=row["valid_until"],
+        metadata=row.get("metadata") or {},
+        score=float(row.get("score") or 0.0),
+    )
+
+
+def _rrf_fuse(
+    vector_ranked: list[tuple[float, dict, float]],
+    lexical_ranked: list[tuple[float, dict, float]],
+    *,
+    limit: int,
+    k: int = 60,
+) -> list[tuple[float, dict]]:
+    fused: dict[str, tuple[float, dict, float]] = {}
+    for ranked in (vector_ranked, lexical_ranked):
+        ordered = sorted(ranked, key=lambda item: item[0], reverse=True)
+        for rank, (_, row, confidence) in enumerate(ordered, start=1):
+            row_id = _row_key(row)
+            current_score, current_row, current_confidence = fused.get(row_id, (0.0, dict(row), 0.0))
+            fused[row_id] = (
+                current_score + 1.0 / (k + rank),
+                current_row,
+                max(current_confidence, confidence),
+            )
+
+    results = []
+    for fusion_score, row, confidence in fused.values():
+        row["score"] = confidence
+        row["fusion_score"] = fusion_score
+        results.append((fusion_score, row))
+    results.sort(key=lambda item: item[0], reverse=True)
+    return results[:limit]
+
+
+def _row_key(row: dict) -> str:
+    return str(row.get("id") or row.get("content_hash") or row.get("source_url") or row.get("content"))
+
+
+def _search_text(row: dict) -> str:
+    text = " ".join(
+        str(row.get(key, ""))
+        for key in ("title", "section", "category", "content", "source_url", "language")
+    )
+    metadata = row.get("metadata") or {}
+    if metadata:
+        text = f"{text} {json.dumps(_json_safe(metadata), ensure_ascii=False)}"
+    return _normalize_text(text)
+
+
+def _normalize_text(value: str) -> str:
+    decomposed = unicodedata.normalize("NFD", value.lower())
+    without_marks = "".join(char for char in decomposed if unicodedata.category(char) != "Mn")
+    asciiish = without_marks.replace("đ", "d")
+    return " ".join(re.findall(r"[a-z0-9]+", asciiish))
+
+
+def _lexical_score(query: str, row: dict) -> float:
+    query_text = _normalize_text(query)
+    if not query_text:
+        return 0.0
+    search_text = str(row.get("search_text") or _search_text(row))
+    query_tokens = _lexical_tokens(query_text)
+    search_tokens = _lexical_tokens(search_text)
+    if not query_tokens or not search_tokens:
+        return 0.0
+    overlap = len(query_tokens & search_tokens)
+    phrase_bonus = 2.0 if query_text in search_text else 0.0
+    return float(overlap) + phrase_bonus
+
+
+def _lexical_tokens(value: str) -> set[str]:
+    return {token for token in value.split() if len(token) >= 2}
 
 
 def _keyword_score(query: str, row: dict) -> float:

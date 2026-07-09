@@ -12,6 +12,7 @@ from fastapi.responses import StreamingResponse
 
 from app.agents.graph import SafariAgentGraph
 from app.config import Settings, get_settings
+from app.crawl_jobs import InMemoryCrawlJobStore, PostgresCrawlJobStore
 from app.embeddings import EmbeddingProvider
 from app.firecrawl import FirecrawlClient, firecrawl_result_to_chunks, scrape_result_to_chunks
 from app.ingestion import fetch_vinwonders_chunks
@@ -37,13 +38,13 @@ async def startup() -> None:
     app.state.settings = settings
     app.state.kb_status = {"provider": "unknown", "fallback": False, "fallback_reason": None}
     app.state.kb = await _build_knowledge_base(settings)
+    app.state.crawl_job_store = await _build_crawl_job_store(settings)
     app.state.agent_graph = SafariAgentGraph(app.state.kb, settings)
     app.state.firecrawl_client = (
         FirecrawlClient(settings.firecrawl_api_key, settings.firecrawl_base_url)
         if settings.firecrawl_api_key
         else None
     )
-    app.state.crawl_jobs = {}
 
 
 @app.get("/health")
@@ -191,7 +192,7 @@ async def crawl(payload: CrawlRequest, background_tasks: BackgroundTasks) -> Cra
     if not app.state.firecrawl_client:
         raise HTTPException(status_code=501, detail="FIRECRAWL_API_KEY is not configured")
     job_id = str(uuid.uuid4())
-    app.state.crawl_jobs[job_id] = {
+    initial = {
         "job_id": job_id,
         "status": "queued",
         "url": str(payload.url),
@@ -209,13 +210,19 @@ async def crawl(payload: CrawlRequest, background_tasks: BackgroundTasks) -> Cra
         "skipped_urls": [],
         "skip_reasons": {},
     }
+    await app.state.crawl_job_store.create(
+        job_id=job_id,
+        url=str(payload.url),
+        payload=payload.model_dump(mode="json"),
+        initial=initial,
+    )
     background_tasks.add_task(_run_crawl_job, job_id, payload)
     return CrawlJobResponse(job_id=job_id, status="queued", url=str(payload.url))
 
 
 @app.get("/admin/crawl-jobs/{job_id}", dependencies=[Depends(require_admin_api_key)])
 async def get_crawl_job(job_id: str) -> dict[str, object]:
-    job = app.state.crawl_jobs.get(job_id)
+    job = await app.state.crawl_job_store.get(job_id)
     if not job:
         raise HTTPException(status_code=404, detail="Crawl job not found")
     return job
@@ -252,6 +259,16 @@ async def _build_knowledge_base(settings: Settings) -> KnowledgeBase:
         return memory
 
 
+async def _build_crawl_job_store(settings: Settings):
+    if getattr(app.state, "kb_status", {}).get("provider") == "postgres":
+        store = PostgresCrawlJobStore(settings.database_url)
+        await store.ensure_ready()
+        return store
+    store = InMemoryCrawlJobStore()
+    await store.ensure_ready()
+    return store
+
+
 def _sse(event: str, payload: dict) -> str:
     return f"event: {event}\ndata: {json.dumps(payload, ensure_ascii=False)}\n\n"
 
@@ -262,8 +279,7 @@ def _word_chunks(text: str) -> list[str]:
 
 
 async def _run_crawl_job(job_id: str, payload: CrawlRequest) -> None:
-    job = app.state.crawl_jobs[job_id]
-    job.update({"status": "running", "updated_at": _utc_now()})
+    await _update_crawl_job(job_id, {"status": "running", "updated_at": _utc_now()})
     try:
         chunks, summary = await _collect_firecrawl_chunks(
             url=str(payload.url),
@@ -272,7 +288,8 @@ async def _run_crawl_job(job_id: str, payload: CrawlRequest) -> None:
             max_pages=payload.max_pages,
         )
         inserted = await app.state.kb.upsert_chunks(chunks)
-        job.update(
+        await _update_crawl_job(
+            job_id,
             {
                 "status": "completed",
                 "updated_at": _utc_now(),
@@ -297,7 +314,10 @@ async def _run_crawl_job(job_id: str, payload: CrawlRequest) -> None:
         )
     except Exception as exc:
         logger.exception("Crawl job failed: %s", job_id)
-        job.update({"status": "failed", "updated_at": _utc_now(), "error": str(exc)})
+        await _update_crawl_job(
+            job_id,
+            {"status": "failed", "updated_at": _utc_now(), "error": str(exc)},
+        )
 
 
 def _utc_now() -> str:
@@ -320,8 +340,9 @@ async def _collect_firecrawl_chunks(
         include_paths=_default_include_paths(url),
         exclude_paths=_default_exclude_paths(),
     )
-    if crawl_job_id and crawl_job_id in app.state.crawl_jobs:
-        app.state.crawl_jobs[crawl_job_id].update(
+    if crawl_job_id:
+        await _update_crawl_job(
+            crawl_job_id,
             {
                 "status": "waiting_firecrawl",
                 "updated_at": _utc_now(),
@@ -332,8 +353,9 @@ async def _collect_firecrawl_chunks(
         str(firecrawl_job["id"]),
         timeout_seconds=240.0,
     )
-    if crawl_job_id and crawl_job_id in app.state.crawl_jobs:
-        app.state.crawl_jobs[crawl_job_id].update(
+    if crawl_job_id:
+        await _update_crawl_job(
+            crawl_job_id,
             {
                 "status": "processing_firecrawl_result",
                 "updated_at": _utc_now(),
@@ -371,8 +393,9 @@ async def _collect_firecrawl_chunks(
         if scrape_url in normalized_discovered_set:
             continue
         try:
-            if crawl_job_id and crawl_job_id in app.state.crawl_jobs:
-                app.state.crawl_jobs[crawl_job_id].update(
+            if crawl_job_id:
+                await _update_crawl_job(
+                    crawl_job_id,
                     {
                         "status": "scraping_discovered_urls",
                         "updated_at": _utc_now(),
@@ -395,8 +418,9 @@ async def _collect_firecrawl_chunks(
                 chunks.extend(scrape_chunks)
                 discovered_urls.append(scrape_url)
                 scraped_count += 1
-                if crawl_job_id and crawl_job_id in app.state.crawl_jobs:
-                    app.state.crawl_jobs[crawl_job_id].update(
+                if crawl_job_id:
+                    await _update_crawl_job(
+                        crawl_job_id,
                         {
                             "updated_at": _utc_now(),
                             "pages_crawled": int(firecrawl_result.get("completed") or 0) + scraped_count,
@@ -406,8 +430,9 @@ async def _collect_firecrawl_chunks(
                     )
         except Exception as exc:
             errors.append({"url": scrape_url, "error": str(exc)})
-            if crawl_job_id and crawl_job_id in app.state.crawl_jobs:
-                app.state.crawl_jobs[crawl_job_id].update(
+            if crawl_job_id:
+                await _update_crawl_job(
+                    crawl_job_id,
                     {
                         "updated_at": _utc_now(),
                         "pages_failed": len(errors),
@@ -431,6 +456,10 @@ async def _collect_firecrawl_chunks(
         "skip_reasons": discovery.skip_reasons,
     }
     return chunks, summary
+
+
+async def _update_crawl_job(job_id: str, updates: dict[str, object]) -> None:
+    await app.state.crawl_job_store.update(job_id, updates)
 
 
 def _strategic_firecrawl_urls(url: str) -> list[str]:

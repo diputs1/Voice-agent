@@ -178,6 +178,51 @@ async def test_low_confidence_threshold_is_configurable():
     assert result["recommended_action"] == "check_official_site"
 
 
+@pytest.mark.asyncio
+async def test_small_talk_routes_directly_without_kb_search():
+    settings = Settings(openai_api_key=None)
+    kb = FailIfSearchKnowledgeBase(EmbeddingProvider(None, "text-embedding-3-small"))
+    await kb.ensure_ready()
+    graph = SafariAgentGraph(kb, settings)
+
+    result = await graph.ainvoke({"transcript": "Xin chào"}, "small-talk-thread")
+
+    assert result["intent"] == "small_talk"
+    assert result["route"] == "direct_response"
+    assert result["handoff_required"] is False
+    assert result["citations"] == []
+    assert "Vinpearl Safari Phú Quốc" in result["answer"]
+
+
+@pytest.mark.asyncio
+async def test_out_of_scope_routes_directly_without_kb_search():
+    settings = Settings(openai_api_key=None)
+    kb = FailIfSearchKnowledgeBase(EmbeddingProvider(None, "text-embedding-3-small"))
+    await kb.ensure_ready()
+    graph = SafariAgentGraph(kb, settings)
+
+    result = await graph.ainvoke({"transcript": "Thời tiết Hà Nội hôm nay thế nào?"}, "oos-thread")
+
+    assert result["intent"] == "out_of_scope"
+    assert result["route"] == "direct_response"
+    assert result["handoff_required"] is False
+    assert "chỉ hỗ trợ" in result["answer"].lower()
+
+
+@pytest.mark.asyncio
+async def test_streaming_pre_answer_uses_direct_node_for_small_talk():
+    settings = Settings(openai_api_key=None)
+    kb = FailIfSearchKnowledgeBase(EmbeddingProvider(None, "text-embedding-3-small"))
+    await kb.ensure_ready()
+    graph = SafariAgentGraph(kb, settings)
+
+    nodes = []
+    async for node_name, _, _ in graph.astream_pre_answer({"transcript": "Xin chào"}, "stream-direct"):
+        nodes.append(node_name)
+
+    assert nodes == ["supervisor", "direct_response"]
+
+
 class RecordingKnowledgeBase(InMemoryKnowledgeBase):
     def __init__(self, embeddings: EmbeddingProvider) -> None:
         super().__init__(embeddings)
@@ -205,6 +250,11 @@ class LowConfidenceKnowledgeBase(InMemoryKnowledgeBase):
                 score=0.1,
             )
         ]
+
+
+class FailIfSearchKnowledgeBase(InMemoryKnowledgeBase):
+    async def search(self, query: str, limit: int = 5):
+        raise AssertionError("KB search should not be called for direct routes")
 
 
 class FakeResponse:
