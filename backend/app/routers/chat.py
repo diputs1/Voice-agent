@@ -6,7 +6,7 @@ import httpx
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import StreamingResponse
 
-from app.schemas import ChatRequest, TTSRequest
+from app.api.schemas import ChatRequest, TTSRequest
 from app.services.chat_service import ChatService
 
 router = APIRouter()

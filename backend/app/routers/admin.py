@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from fastapi import APIRouter, BackgroundTasks, Depends, Header, HTTPException, Request
 
-from app.schemas import CrawlJobResponse, CrawlRequest, IngestRequest
+from app.api.schemas import CrawlJobResponse, CrawlRequest, IngestRequest
 from app.services.ingestion_service import IngestionService
 
 
@@ -47,3 +47,20 @@ async def crawl(
 async def get_crawl_job(request: Request, job_id: str) -> dict[str, object]:
     service: IngestionService = request.app.state.ingestion_service
     return await service.get_crawl_job(job_id)
+
+
+@router.get("/sites/{site_id}/status")
+async def get_site_status(request: Request, site_id: str) -> dict[str, object]:
+    kb = request.app.state.kb
+    if not hasattr(kb, "site_status"):
+        return {"site_id": site_id, "document_count": None, "category_counts": {}}
+    return await kb.site_status(site_id)
+
+
+@router.get("/kb/status")
+async def get_kb_status(request: Request) -> dict[str, object]:
+    kb = request.app.state.kb
+    base = dict(getattr(request.app.state, "kb_status", {}))
+    if hasattr(kb, "site_status"):
+        base.update(await kb.site_status(None))
+    return base

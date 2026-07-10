@@ -25,6 +25,7 @@ class IngestedChunk:
     valid_until: datetime | None
     language: str = "vi"
     metadata: dict[str, Any] | None = None
+    site_id: str | None = None
 
 
 STABLE_SEED_FACTS = [

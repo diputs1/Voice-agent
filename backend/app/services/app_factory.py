@@ -5,13 +5,14 @@ import logging
 
 from fastapi import FastAPI
 
-from app.agents.graph import SafariAgentGraph
-from app.cache import TTLQACache
-from app.config import Settings
-from app.crawl_jobs import InMemoryCrawlJobStore, PostgresCrawlJobStore
-from app.embeddings import EmbeddingProvider
-from app.firecrawl import FirecrawlClient
-from app.kb import InMemoryKnowledgeBase, KnowledgeBase, PostgresKnowledgeBase
+from app.agents.graphs import WebsiteAgentGraph
+from app.core.cache import TTLQACache
+from app.core.config import Settings
+from app.crawling.jobs import InMemoryCrawlJobStore, PostgresCrawlJobStore
+from app.knowledge.embeddings import EmbeddingProvider
+from app.crawling.firecrawl import FirecrawlClient
+from app.knowledge.kb import InMemoryKnowledgeBase, KnowledgeBase, PostgresKnowledgeBase
+from app.core.observability import configure_langsmith
 from app.services.chat_service import ChatService
 from app.services.ingestion_service import IngestionService
 
@@ -20,10 +21,11 @@ logger = logging.getLogger(__name__)
 
 async def initialize_app_state(app: FastAPI, settings: Settings) -> None:
     app.state.settings = settings
+    app.state.langsmith_status = configure_langsmith(settings)
     app.state.kb_status = {"provider": "unknown", "fallback": False, "fallback_reason": None}
     app.state.kb = await build_knowledge_base(app, settings)
     app.state.crawl_job_store = await build_crawl_job_store(app, settings)
-    app.state.agent_graph = SafariAgentGraph(app.state.kb, settings)
+    app.state.agent_graph = WebsiteAgentGraph(app.state.kb, settings)
     app.state.agent_semaphore = asyncio.Semaphore(settings.agent_max_concurrency)
     app.state.qa_cache = TTLQACache(
         ttl_seconds=settings.qa_cache_ttl_seconds,

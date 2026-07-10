@@ -6,7 +6,7 @@ from typing import Any
 
 from app.agents.logic.intent import TIME_SENSITIVE_CATEGORIES
 from app.agents.schemas import SafariState
-from app.kb import KnowledgeHit
+from app.knowledge.kb import KnowledgeHit
 from app.prompts import load_prompt
 
 HANDOFF_ACTIONS = {
@@ -245,6 +245,7 @@ def hit_payload(hit: KnowledgeHit) -> dict[str, Any]:
     return {
         **citation(hit),
         "id": hit.id,
+        "site_id": hit.site_id,
         "content": context_content(hit),
         "score": hit.score,
     }

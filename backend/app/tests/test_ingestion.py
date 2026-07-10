@@ -1,6 +1,6 @@
 from bs4 import BeautifulSoup
 
-from app.ingestion import classify_category, seed_chunks, soup_to_chunks
+from app.crawling.ingestion import classify_category, seed_chunks, soup_to_chunks
 
 
 def test_seed_chunks_have_required_metadata():

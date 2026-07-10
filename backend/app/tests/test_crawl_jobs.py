@@ -1,6 +1,6 @@
 import pytest
 
-from app.crawl_jobs import InMemoryCrawlJobStore
+from app.crawling.jobs import InMemoryCrawlJobStore
 
 
 @pytest.mark.asyncio

@@ -1,4 +1,4 @@
-from app.link_discovery import LinkDiscoveryAgent, classify_url_category, normalize_url, skip_reason
+from app.crawling.link_discovery import LinkDiscoveryAgent, classify_url_category, normalize_url, skip_reason
 
 
 def test_classifies_vin_url_categories():

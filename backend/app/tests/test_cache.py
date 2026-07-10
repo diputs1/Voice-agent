@@ -3,10 +3,10 @@ from datetime import UTC, datetime
 
 import pytest
 
-from app.cache import QACacheKey, TTLQACache, normalize_cache_query
-from app.embeddings import EmbeddingProvider
-from app.ingestion import IngestedChunk
-from app.kb import InMemoryKnowledgeBase
+from app.core.cache import QACacheKey, TTLQACache, normalize_cache_query
+from app.knowledge.embeddings import EmbeddingProvider
+from app.crawling.ingestion import IngestedChunk
+from app.knowledge.kb import InMemoryKnowledgeBase
 
 
 @pytest.mark.asyncio

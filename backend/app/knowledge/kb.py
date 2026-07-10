@@ -7,13 +7,15 @@ from hashlib import sha256
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
 from typing import Protocol
+from urllib.parse import urlparse
 
 import psycopg
 from psycopg.rows import dict_row
 from langsmith import traceable
 
-from app.embeddings import EmbeddingProvider, pgvector_literal
-from app.ingestion import IngestedChunk, seed_chunks
+from app.knowledge.embeddings import EmbeddingProvider, pgvector_literal
+from app.crawling.ingestion import IngestedChunk, seed_chunks
+from app.core.sites import canonical_root_url, site_id_for_url
 
 
 @dataclass
@@ -29,6 +31,7 @@ class KnowledgeHit:
     valid_until: str | None
     metadata: dict | None
     score: float
+    site_id: str | None = None
 
 
 class KnowledgeBase(Protocol):
@@ -36,17 +39,19 @@ class KnowledgeBase(Protocol):
 
     async def upsert_chunks(self, chunks: list[IngestedChunk]) -> int: ...
 
-    async def search(self, query: str, limit: int = 5) -> list[KnowledgeHit]: ...
+    async def search(self, query: str, limit: int = 5, site_id: str | None = None) -> list[KnowledgeHit]: ...
 
-    async def save_thread_turn(self, thread_id: str, transcript: str, answer: str) -> None: ...
+    async def save_thread_turn(
+        self, thread_id: str, transcript: str, answer: str, site_id: str | None = None
+    ) -> None: ...
 
     async def get_thread(self, thread_id: str) -> list[dict]: ...
 
-    async def doc_set_hash(self) -> str: ...
+    async def doc_set_hash(self, site_id: str | None = None) -> str: ...
 
 
 class Retriever(Protocol):
-    async def search(self, query: str, limit: int = 5) -> list[KnowledgeHit]: ...
+    async def search(self, query: str, limit: int = 5, site_id: str | None = None) -> list[KnowledgeHit]: ...
 
 
 class IngestionSink(Protocol):
@@ -54,13 +59,15 @@ class IngestionSink(Protocol):
 
 
 class ThreadStore(Protocol):
-    async def save_thread_turn(self, thread_id: str, transcript: str, answer: str) -> None: ...
+    async def save_thread_turn(
+        self, thread_id: str, transcript: str, answer: str, site_id: str | None = None
+    ) -> None: ...
 
     async def get_thread(self, thread_id: str) -> list[dict]: ...
 
 
 class DocSetHasher(Protocol):
-    async def doc_set_hash(self) -> str: ...
+    async def doc_set_hash(self, site_id: str | None = None) -> str: ...
 
 
 class AgentKnowledgeBase(Retriever, ThreadStore, Protocol):
@@ -76,6 +83,7 @@ class InMemoryKnowledgeBase:
         self.embeddings = embeddings
         self.rows: list[dict] = []
         self.threads: dict[str, list[dict]] = {}
+        self.sites: dict[str, dict] = {}
 
     async def ensure_ready(self) -> None:
         if not self.rows:
@@ -83,23 +91,28 @@ class InMemoryKnowledgeBase:
 
     async def upsert_chunks(self, chunks: list[IngestedChunk]) -> int:
         vectors = await self.embeddings.embed_documents([chunk.content for chunk in chunks])
-        existing_hashes = {row["content_hash"] for row in self.rows}
+        existing_hashes = {(row.get("site_id") or "default", row["content_hash"]) for row in self.rows}
         inserted = 0
         for chunk, vector in zip(chunks, vectors, strict=True):
-            if chunk.content_hash in existing_hashes:
+            chunk_site_id = chunk.site_id or site_id_for_url(chunk.source_url)
+            if (chunk_site_id, chunk.content_hash) in existing_hashes:
                 continue
             row = {**asdict(chunk), "embedding": vector, "id": chunk.content_hash}
+            row["site_id"] = chunk_site_id
             row["search_text"] = _search_text(row)
             self.rows.append(row)
+            existing_hashes.add((chunk_site_id, chunk.content_hash))
             inserted += 1
         return inserted
 
     @traceable(name="kb.in_memory_search")
-    async def search(self, query: str, limit: int = 5) -> list[KnowledgeHit]:
+    async def search(self, query: str, limit: int = 5, site_id: str | None = None) -> list[KnowledgeHit]:
         query_vector = await self.embeddings.embed_query(query)
         vector_ranked = []
         lexical_ranked = []
         for row in self.rows:
+            if site_id and row.get("site_id") != site_id:
+                continue
             confidence = _adjusted_score(query, row, _cosine(query_vector, row["embedding"]))
             lexical = _lexical_score(query, row)
             vector_ranked.append((confidence, row, confidence))
@@ -110,6 +123,7 @@ class InMemoryKnowledgeBase:
         return [
             KnowledgeHit(
                 id=row["id"],
+                site_id=row.get("site_id"),
                 title=row["title"],
                 section=row["section"],
                 category=row["category"],
@@ -124,9 +138,12 @@ class InMemoryKnowledgeBase:
             for _, row in scored[:limit]
         ]
 
-    async def save_thread_turn(self, thread_id: str, transcript: str, answer: str) -> None:
+    async def save_thread_turn(
+        self, thread_id: str, transcript: str, answer: str, site_id: str | None = None
+    ) -> None:
         self.threads.setdefault(thread_id, []).append(
             {
+                "site_id": site_id,
                 "transcript": transcript,
                 "answer": answer,
                 "created_at": datetime.now(UTC).isoformat(),
@@ -136,9 +153,44 @@ class InMemoryKnowledgeBase:
     async def get_thread(self, thread_id: str) -> list[dict]:
         return self.threads.get(thread_id, [])
 
-    async def doc_set_hash(self) -> str:
-        content_hashes = sorted(str(row.get("content_hash") or row.get("id") or "") for row in self.rows)
+    async def doc_set_hash(self, site_id: str | None = None) -> str:
+        content_hashes = sorted(
+            str(row.get("content_hash") or row.get("id") or "")
+            for row in self.rows
+            if not site_id or row.get("site_id") == site_id
+        )
         return sha256("|".join(content_hashes).encode("utf-8")).hexdigest()
+
+    async def upsert_site(
+        self,
+        *,
+        site_id: str,
+        root_url: str,
+        allowed_domains: list[str],
+        crawl_policy: dict | None = None,
+    ) -> None:
+        self.sites[site_id] = {
+            "site_id": site_id,
+            "root_url": root_url,
+            "allowed_domains": allowed_domains,
+            "crawl_policy": crawl_policy or {},
+            "created_at": self.sites.get(site_id, {}).get("created_at") or datetime.now(UTC).isoformat(),
+            "updated_at": datetime.now(UTC).isoformat(),
+        }
+
+    async def site_status(self, site_id: str | None = None) -> dict:
+        rows = [row for row in self.rows if not site_id or row.get("site_id") == site_id]
+        category_counts: dict[str, int] = {}
+        for row in rows:
+            category_counts[str(row.get("category") or "unknown")] = (
+                category_counts.get(str(row.get("category") or "unknown"), 0) + 1
+            )
+        return {
+            "site_id": site_id,
+            "site_count": len(self.sites),
+            "document_count": len(rows),
+            "category_counts": category_counts,
+        }
 
 
 class PostgresKnowledgeBase:
@@ -148,17 +200,32 @@ class PostgresKnowledgeBase:
 
     async def ensure_ready(self) -> None:
         with psycopg.connect(self.database_url, autocommit=True) as conn:
+            conn.execute("CREATE EXTENSION IF NOT EXISTS pgcrypto")
             conn.execute("CREATE EXTENSION IF NOT EXISTS vector")
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS sites (
+                  site_id TEXT PRIMARY KEY,
+                  root_url TEXT NOT NULL,
+                  allowed_domains TEXT[] NOT NULL DEFAULT ARRAY[]::text[],
+                  crawl_policy JSONB NOT NULL DEFAULT '{}'::jsonb,
+                  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+                  updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+                )
+                """
+            )
             conn.execute(
                 """
                 CREATE TABLE IF NOT EXISTS documents (
                   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                  site_id TEXT NOT NULL DEFAULT 'default',
                   source_url TEXT NOT NULL,
+                  canonical_url TEXT,
                   title TEXT NOT NULL,
                   section TEXT NOT NULL,
                   category TEXT NOT NULL,
                   content TEXT NOT NULL,
-                  content_hash TEXT NOT NULL UNIQUE,
+                  content_hash TEXT NOT NULL,
                   language TEXT NOT NULL DEFAULT 'vi',
                   crawled_at TIMESTAMPTZ NOT NULL,
                   valid_until TIMESTAMPTZ,
@@ -167,6 +234,9 @@ class PostgresKnowledgeBase:
                 )
                 """
             )
+            conn.execute("ALTER TABLE documents ADD COLUMN IF NOT EXISTS site_id TEXT NOT NULL DEFAULT 'default'")
+            conn.execute("ALTER TABLE documents ADD COLUMN IF NOT EXISTS canonical_url TEXT")
+            conn.execute("ALTER TABLE documents DROP CONSTRAINT IF EXISTS documents_content_hash_key")
             conn.execute("ALTER TABLE documents ADD COLUMN IF NOT EXISTS search_text TEXT NOT NULL DEFAULT ''")
             conn.execute(
                 """
@@ -180,12 +250,29 @@ class PostgresKnowledgeBase:
                 CREATE TABLE IF NOT EXISTS thread_turns (
                   id BIGSERIAL PRIMARY KEY,
                   thread_id TEXT NOT NULL,
+                  site_id TEXT,
                   transcript TEXT NOT NULL,
                   answer TEXT NOT NULL,
                   created_at TIMESTAMPTZ NOT NULL DEFAULT now()
                 )
                 """
             )
+            conn.execute("ALTER TABLE thread_turns ADD COLUMN IF NOT EXISTS site_id TEXT")
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS eval_runs (
+                  run_id TEXT PRIMARY KEY,
+                  graph_version TEXT NOT NULL,
+                  dataset TEXT NOT NULL,
+                  metrics JSONB NOT NULL DEFAULT '{}'::jsonb,
+                  created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+                )
+                """
+            )
+            conn.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS documents_site_content_hash_idx ON documents (site_id, content_hash)"
+            )
+            conn.execute("CREATE INDEX IF NOT EXISTS documents_site_idx ON documents (site_id)")
             conn.execute(
                 "CREATE INDEX IF NOT EXISTS documents_embedding_idx ON documents USING ivfflat (embedding vector_cosine_ops)"
             )
@@ -202,18 +289,23 @@ class PostgresKnowledgeBase:
         inserted = 0
         with psycopg.connect(self.database_url, autocommit=True) as conn:
             for chunk, vector in zip(chunks, vectors, strict=True):
+                chunk_site_id = chunk.site_id or site_id_for_url(chunk.source_url)
+                canonical_url = (chunk.metadata or {}).get("canonical_url") or chunk.source_url
+                self._upsert_site_for_chunk(conn, chunk_site_id, chunk.source_url)
                 result = conn.execute(
                     """
                     INSERT INTO documents (
-                      source_url, title, section, category, content, content_hash,
+                      site_id, source_url, canonical_url, title, section, category, content, content_hash,
                       language, crawled_at, valid_until, metadata, embedding, search_text
                     )
-                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb, %s::vector, %s)
-                    ON CONFLICT (content_hash) DO NOTHING
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb, %s::vector, %s)
+                    ON CONFLICT (site_id, content_hash) DO NOTHING
                     RETURNING id
                     """,
                     (
+                        chunk_site_id,
                         chunk.source_url,
+                        str(canonical_url),
                         chunk.title,
                         chunk.section,
                         chunk.category,
@@ -232,35 +324,41 @@ class PostgresKnowledgeBase:
         return inserted
 
     @traceable(name="kb.postgres_search")
-    async def search(self, query: str, limit: int = 5) -> list[KnowledgeHit]:
+    async def search(self, query: str, limit: int = 5, site_id: str | None = None) -> list[KnowledgeHit]:
         vector = await self.embeddings.embed_query(query)
         query_text = _normalize_text(query)
+        site_filter = "WHERE site_id = %s" if site_id else ""
         with psycopg.connect(self.database_url, row_factory=dict_row) as conn:
             vector_rows = conn.execute(
-                """
-                SELECT id::text, title, section, category, content, source_url, language,
+                f"""
+                SELECT id::text, site_id, title, section, category, content, source_url, language,
                        crawled_at::text, valid_until::text, metadata,
                        1 - (embedding <=> %s::vector) AS score
                 FROM documents
+                {site_filter}
                 ORDER BY embedding <=> %s::vector
                 LIMIT %s
                 """,
-                (pgvector_literal(vector), pgvector_literal(vector), max(limit * 6, 20)),
+                (pgvector_literal(vector), site_id, pgvector_literal(vector), max(limit * 6, 20))
+                if site_id
+                else (pgvector_literal(vector), pgvector_literal(vector), max(limit * 6, 20)),
             ).fetchall()
             lexical_rows = []
             if query_text:
                 lexical_rows = conn.execute(
-                    """
-                    SELECT id::text, title, section, category, content, source_url, language,
+                    f"""
+                    SELECT id::text, site_id, title, section, category, content, source_url, language,
                            crawled_at::text, valid_until::text, metadata,
                            ts_rank_cd(search_vector, websearch_to_tsquery('simple', %s)) AS lexical_score,
                            1 - (embedding <=> %s::vector) AS score
                     FROM documents
-                    WHERE search_vector @@ websearch_to_tsquery('simple', %s)
+                    WHERE {'site_id = %s AND ' if site_id else ''}search_vector @@ websearch_to_tsquery('simple', %s)
                     ORDER BY lexical_score DESC
                     LIMIT %s
                     """,
-                    (query_text, pgvector_literal(vector), query_text, max(limit * 6, 20)),
+                    (query_text, pgvector_literal(vector), site_id, query_text, max(limit * 6, 20))
+                    if site_id
+                    else (query_text, pgvector_literal(vector), query_text, max(limit * 6, 20)),
                 ).fetchall()
         vector_ranked = []
         for row in vector_rows:
@@ -276,11 +374,13 @@ class PostgresKnowledgeBase:
         reranked = [row for _, row in _diversify_categories(query, fused, limit)]
         return [_knowledge_hit_from_row(row) for row in reranked[:limit]]
 
-    async def save_thread_turn(self, thread_id: str, transcript: str, answer: str) -> None:
+    async def save_thread_turn(
+        self, thread_id: str, transcript: str, answer: str, site_id: str | None = None
+    ) -> None:
         with psycopg.connect(self.database_url, autocommit=True) as conn:
             conn.execute(
-                "INSERT INTO thread_turns (thread_id, transcript, answer) VALUES (%s, %s, %s)",
-                (thread_id, transcript, answer),
+                "INSERT INTO thread_turns (thread_id, site_id, transcript, answer) VALUES (%s, %s, %s, %s)",
+                (thread_id, site_id, transcript, answer),
             )
 
     async def get_thread(self, thread_id: str) -> list[dict]:
@@ -288,7 +388,7 @@ class PostgresKnowledgeBase:
             return list(
                 conn.execute(
                     """
-                    SELECT transcript, answer, created_at::text
+                    SELECT site_id, transcript, answer, created_at::text
                     FROM thread_turns
                     WHERE thread_id = %s
                     ORDER BY created_at ASC, id ASC
@@ -297,15 +397,93 @@ class PostgresKnowledgeBase:
                 ).fetchall()
             )
 
-    async def doc_set_hash(self) -> str:
+    async def doc_set_hash(self, site_id: str | None = None) -> str:
         with psycopg.connect(self.database_url) as conn:
             value = conn.execute(
-                """
+                f"""
                 SELECT md5(coalesce(string_agg(content_hash, ',' ORDER BY content_hash), ''))
                 FROM documents
+                {'WHERE site_id = %s' if site_id else ''}
                 """
+                ,
+                (site_id,) if site_id else (),
             ).fetchone()[0]
         return str(value)
+
+    async def upsert_site(
+        self,
+        *,
+        site_id: str,
+        root_url: str,
+        allowed_domains: list[str],
+        crawl_policy: dict | None = None,
+    ) -> None:
+        with psycopg.connect(self.database_url, autocommit=True) as conn:
+            conn.execute(
+                """
+                INSERT INTO sites (site_id, root_url, allowed_domains, crawl_policy)
+                VALUES (%s, %s, %s, %s::jsonb)
+                ON CONFLICT (site_id) DO UPDATE SET
+                  root_url = EXCLUDED.root_url,
+                  allowed_domains = EXCLUDED.allowed_domains,
+                  crawl_policy = EXCLUDED.crawl_policy,
+                  updated_at = now()
+                """,
+                (
+                    site_id,
+                    root_url,
+                    allowed_domains,
+                    json.dumps(_json_safe(crawl_policy or {}), ensure_ascii=False),
+                ),
+            )
+
+    async def site_status(self, site_id: str | None = None) -> dict:
+        with psycopg.connect(self.database_url, row_factory=dict_row) as conn:
+            site_rows = conn.execute(
+                """
+                SELECT site_id, root_url, allowed_domains, crawl_policy, created_at::text, updated_at::text
+                FROM sites
+                WHERE (%s::text IS NULL OR site_id = %s)
+                ORDER BY updated_at DESC
+                """,
+                (site_id, site_id),
+            ).fetchall()
+            category_rows = conn.execute(
+                """
+                SELECT category, count(*) AS count
+                FROM documents
+                WHERE (%s::text IS NULL OR site_id = %s)
+                GROUP BY category
+                ORDER BY count DESC, category ASC
+                """,
+                (site_id, site_id),
+            ).fetchall()
+            doc_count = conn.execute(
+                """
+                SELECT count(*) AS count, max(crawled_at)::text AS latest_crawl
+                FROM documents
+                WHERE (%s::text IS NULL OR site_id = %s)
+                """,
+                (site_id, site_id),
+            ).fetchone()
+            stale_count = conn.execute(
+                """
+                SELECT count(*) AS count
+                FROM documents
+                WHERE (%s::text IS NULL OR site_id = %s)
+                  AND valid_until IS NOT NULL
+                  AND valid_until < now()
+                """,
+                (site_id, site_id),
+            ).fetchone()
+        return {
+            "site_id": site_id,
+            "sites": [dict(row) for row in site_rows],
+            "document_count": int(doc_count["count"] or 0),
+            "latest_crawl": doc_count["latest_crawl"],
+            "category_counts": {row["category"]: int(row["count"]) for row in category_rows},
+            "stale_count": int(stale_count["count"] or 0),
+        }
 
     def _backfill_search_text(self, conn) -> None:
         with conn.cursor(row_factory=dict_row) as cur:
@@ -322,6 +500,17 @@ class PostgresKnowledgeBase:
                 (_search_text(dict(row)), row["id"]),
             )
 
+    def _upsert_site_for_chunk(self, conn, site_id: str, source_url: str) -> None:
+        root_url = canonical_root_url(source_url)
+        conn.execute(
+            """
+            INSERT INTO sites (site_id, root_url, allowed_domains, crawl_policy)
+            VALUES (%s, %s, %s, '{}'::jsonb)
+            ON CONFLICT (site_id) DO NOTHING
+            """,
+            (site_id, root_url, [urlparse_root_host(source_url)]),
+        )
+
 
 def _cosine(left: list[float], right: list[float]) -> float:
     return sum(a * b for a, b in zip(left, right, strict=True))
@@ -330,6 +519,7 @@ def _cosine(left: list[float], right: list[float]) -> float:
 def _knowledge_hit_from_row(row: dict) -> KnowledgeHit:
     return KnowledgeHit(
         id=str(row["id"]),
+        site_id=row.get("site_id"),
         title=row["title"],
         section=row["section"],
         category=row["category"],
@@ -572,3 +762,8 @@ def _json_safe(value):
     if isinstance(value, list):
         return [_json_safe(item) for item in value]
     return value
+
+
+def urlparse_root_host(url: str) -> str:
+    parsed = urlparse(url)
+    return parsed.netloc.lower() or "default"

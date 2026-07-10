@@ -3,16 +3,18 @@ from __future__ import annotations
 import logging
 import uuid
 from datetime import UTC, datetime
+from urllib.parse import urlparse
 
 from fastapi import BackgroundTasks, HTTPException
 
-from app.config import Settings
-from app.crawl_jobs import CrawlJobStore
-from app.firecrawl import FirecrawlClient, firecrawl_result_to_chunks, scrape_result_to_chunks
-from app.ingestion import fetch_vinwonders_chunks
-from app.kb import IngestionSink
-from app.link_discovery import LinkDiscoveryAgent, discovery_metadata_for, normalize_url
-from app.schemas import CrawlJobResponse, CrawlRequest, IngestRequest
+from app.core.config import Settings
+from app.crawling.jobs import CrawlJobStore
+from app.crawling.firecrawl import FirecrawlClient, firecrawl_result_to_chunks, scrape_result_to_chunks
+from app.crawling.ingestion import fetch_vinwonders_chunks
+from app.knowledge.kb import IngestionSink
+from app.crawling.link_discovery import LinkDiscoveryAgent, discovery_metadata_for, normalize_url
+from app.api.schemas import CrawlJobResponse, CrawlRequest, IngestRequest
+from app.core.sites import canonical_root_url, site_id_for_url
 
 logger = logging.getLogger(__name__)
 
@@ -34,11 +36,15 @@ class IngestionService:
     async def ingest_vinwonders(self, payload: IngestRequest | None = None) -> dict[str, int | str]:
         url = payload.url if payload and payload.url else self.settings.vinwonders_source_url
         if self.firecrawl_client:
+            site_id = site_id_for_url(url)
             chunks, summary = await self.collect_firecrawl_chunks(
                 url=url,
                 max_depth=2,
                 max_pages=40,
                 crawl_job_id=None,
+                site_id=site_id,
+                include_subdomains=False,
+                exclude_patterns=[],
             )
             inserted = await self.kb.upsert_chunks(chunks)
             return {
@@ -67,10 +73,14 @@ class IngestionService:
         if not self.firecrawl_client:
             raise HTTPException(status_code=501, detail="FIRECRAWL_API_KEY is not configured")
         job_id = str(uuid.uuid4())
+        url = str(payload.url)
+        site_id = site_id_for_url(url)
         initial = {
             "job_id": job_id,
             "status": "queued",
-            "url": str(payload.url),
+            "url": url,
+            "site_id": site_id,
+            "root_url": canonical_root_url(url),
             "created_at": utc_now(),
             "updated_at": utc_now(),
             "pages_crawled": 0,
@@ -87,12 +97,12 @@ class IngestionService:
         }
         await self.crawl_job_store.create(
             job_id=job_id,
-            url=str(payload.url),
+            url=url,
             payload=payload.model_dump(mode="json"),
             initial=initial,
         )
         background_tasks.add_task(self.run_crawl_job, job_id, payload)
-        return CrawlJobResponse(job_id=job_id, status="queued", url=str(payload.url))
+        return CrawlJobResponse(job_id=job_id, status="queued", url=url, site_id=site_id)
 
     async def get_crawl_job(self, job_id: str) -> dict[str, object]:
         job = await self.crawl_job_store.get(job_id)
@@ -103,11 +113,23 @@ class IngestionService:
     async def run_crawl_job(self, job_id: str, payload: CrawlRequest) -> None:
         await self.update_crawl_job(job_id, {"status": "running", "updated_at": utc_now()})
         try:
+            url = str(payload.url)
+            site_id = site_id_for_url(url)
+            if hasattr(self.kb, "upsert_site"):
+                await self.kb.upsert_site(  # type: ignore[attr-defined]
+                    site_id=site_id,
+                    root_url=canonical_root_url(url),
+                    allowed_domains=[urlparse(url).netloc.lower()],
+                    crawl_policy=payload.model_dump(mode="json"),
+                )
             chunks, summary = await self.collect_firecrawl_chunks(
-                url=str(payload.url),
+                url=url,
                 max_depth=payload.max_depth,
                 crawl_job_id=job_id,
                 max_pages=payload.max_pages,
+                site_id=site_id,
+                include_subdomains=payload.include_subdomains,
+                exclude_patterns=payload.exclude_patterns,
             )
             inserted = await self.kb.upsert_chunks(chunks)
             await self.update_crawl_job(
@@ -116,6 +138,8 @@ class IngestionService:
                     "status": "completed",
                     "updated_at": utc_now(),
                     "provider": "firecrawl",
+                    "site_id": site_id,
+                    "root_url": canonical_root_url(url),
                     "firecrawl_id": summary["firecrawl_id"],
                     "started_at": summary["started_at"],
                     "finished_at": summary["finished_at"],
@@ -148,6 +172,9 @@ class IngestionService:
         max_depth: int,
         max_pages: int,
         crawl_job_id: str | None,
+        site_id: str | None,
+        include_subdomains: bool,
+        exclude_patterns: list[str],
     ) -> tuple[list, dict[str, object]]:
         if not self.firecrawl_client:
             raise HTTPException(status_code=501, detail="FIRECRAWL_API_KEY is not configured")
@@ -157,7 +184,8 @@ class IngestionService:
             max_depth=max_depth,
             limit=max_pages,
             include_paths=default_include_paths(url),
-            exclude_paths=default_exclude_paths(),
+            exclude_paths=default_exclude_paths(exclude_patterns),
+            allow_subdomains=include_subdomains,
         )
         if crawl_job_id:
             await self.update_crawl_job(
@@ -194,9 +222,13 @@ class IngestionService:
         }
         errors: list[dict[str, str]] = []
         scraped_count = 0
+        allowed_domains = [urlparse(url).netloc.lower()]
         discovery = LinkDiscoveryAgent(
             seed_url=url,
             fallback_urls=strategic_firecrawl_urls(url),
+            allowed_domains=allowed_domains,
+            include_subdomains=include_subdomains,
+            exclude_patterns=exclude_patterns,
         ).discover_from_firecrawl_result(firecrawl_result)
         selected_urls = [item.url for item in discovery.selected_urls]
         selected_metadata = {
@@ -206,6 +238,7 @@ class IngestionService:
             result=firecrawl_result,
             seed_url=url,
             crawl_job_id=crawl_job_id,
+            site_id=site_id,
             url_metadata=selected_metadata,
         )
 
@@ -233,6 +266,7 @@ class IngestionService:
                     result=scrape_result,
                     seed_url=url,
                     crawl_job_id=crawl_job_id,
+                    site_id=site_id,
                     url_metadata={scrape_url: selected_metadata[scrape_url]},
                 )
                 if scrape_chunks:
@@ -306,23 +340,17 @@ def strategic_firecrawl_urls(url: str) -> list[str]:
 
 
 def default_include_paths(url: str) -> list[str]:
-    if "/vi/" not in url and "/en/" not in url:
-        return []
-    return [
-        "vi/.*vinpearl-safari-phu-quoc.*",
-        "en/.*vinpearl-safari-phu-quoc.*",
-        "vi/promotions.*",
-        "en/promotions.*",
-        "vi/uu-dai/.*",
-        "en/uu-dai/.*",
-        "vi/wonderpedia/news/.*(vinpearl-safari-phu-quoc|voucher|combo|affiliate|vinclub|gia-ve).*",
-        "en/wonderpedia/news/.*(vinpearl-safari-phu-quoc|voucher|combo|affiliate|vinclub|ticket|price).*",
-    ]
+    del url
+    return []
 
 
-def default_exclude_paths() -> list[str]:
+def default_exclude_paths(extra_patterns: list[str] | None = None) -> list[str]:
     return [
         ".*\\.(jpg|jpeg|png|gif|webp|svg|ico|css|js|mp4|mov|zip)$",
-        ".*/(ko|zh|ru)/.*",
         ".*login.*",
-    ]
+        ".*register.*",
+        ".*dang-nhap.*",
+        ".*dang-ky.*",
+        ".*checkout.*",
+        ".*cart.*",
+    ] + list(extra_patterns or [])

@@ -1,8 +1,8 @@
 import pytest
 
-from app.embeddings import EmbeddingProvider
-from app.ingestion import IngestedChunk
-from app.kb import InMemoryKnowledgeBase, _adjusted_score, _diversify_categories, _normalize_text, _rrf_fuse
+from app.knowledge.embeddings import EmbeddingProvider
+from app.crawling.ingestion import IngestedChunk
+from app.knowledge.kb import InMemoryKnowledgeBase, _adjusted_score, _diversify_categories, _normalize_text, _rrf_fuse
 
 from datetime import UTC, datetime
 

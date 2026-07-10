@@ -70,6 +70,7 @@ class PostgresCrawlJobStore:
                 """
                 CREATE TABLE IF NOT EXISTS crawl_jobs (
                   job_id TEXT PRIMARY KEY,
+                  site_id TEXT,
                   status TEXT NOT NULL,
                   url TEXT NOT NULL,
                   payload JSONB NOT NULL DEFAULT '{}'::jsonb,
@@ -79,9 +80,11 @@ class PostgresCrawlJobStore:
                 )
                 """
             )
+            conn.execute("ALTER TABLE crawl_jobs ADD COLUMN IF NOT EXISTS site_id TEXT")
             conn.execute(
                 "CREATE INDEX IF NOT EXISTS crawl_jobs_status_idx ON crawl_jobs (status, updated_at DESC)"
             )
+            conn.execute("CREATE INDEX IF NOT EXISTS crawl_jobs_site_idx ON crawl_jobs (site_id, updated_at DESC)")
 
     async def create(
         self,
@@ -92,13 +95,15 @@ class PostgresCrawlJobStore:
         initial: dict[str, Any],
     ) -> None:
         status = str(initial.get("status") or "queued")
+        site_id = initial.get("site_id")
         result = {key: value for key, value in initial.items() if key not in {"job_id", "status", "url"}}
         with psycopg.connect(self.database_url, autocommit=True) as conn:
             conn.execute(
                 """
-                INSERT INTO crawl_jobs (job_id, status, url, payload, result)
-                VALUES (%s, %s, %s, %s::jsonb, %s::jsonb)
+                INSERT INTO crawl_jobs (job_id, site_id, status, url, payload, result)
+                VALUES (%s, %s, %s, %s, %s::jsonb, %s::jsonb)
                 ON CONFLICT (job_id) DO UPDATE SET
+                  site_id = EXCLUDED.site_id,
                   status = EXCLUDED.status,
                   url = EXCLUDED.url,
                   payload = EXCLUDED.payload,
@@ -107,6 +112,7 @@ class PostgresCrawlJobStore:
                 """,
                 (
                     job_id,
+                    site_id,
                     status,
                     url,
                     json.dumps(_json_safe(payload), ensure_ascii=False),
@@ -120,6 +126,7 @@ class PostgresCrawlJobStore:
             return
         status = str(updates.get("status") or current.get("status") or "queued")
         url = str(updates.get("url") or current.get("url") or "")
+        site_id = updates.get("site_id") or current.get("site_id")
         result = {
             key: value
             for key, value in {**current, **updates}.items()
@@ -129,17 +136,17 @@ class PostgresCrawlJobStore:
             conn.execute(
                 """
                 UPDATE crawl_jobs
-                SET status = %s, url = %s, result = %s::jsonb, updated_at = now()
+                SET site_id = %s, status = %s, url = %s, result = %s::jsonb, updated_at = now()
                 WHERE job_id = %s
                 """,
-                (status, url, json.dumps(_json_safe(result), ensure_ascii=False), job_id),
+                (site_id, status, url, json.dumps(_json_safe(result), ensure_ascii=False), job_id),
             )
 
     async def get(self, job_id: str) -> dict[str, Any] | None:
         with psycopg.connect(self.database_url, row_factory=dict_row) as conn:
             row = conn.execute(
                 """
-                SELECT job_id, status, url, payload, result, created_at::text, updated_at::text
+                SELECT job_id, site_id, status, url, payload, result, created_at::text, updated_at::text
                 FROM crawl_jobs
                 WHERE job_id = %s
                 """,
@@ -150,6 +157,7 @@ class PostgresCrawlJobStore:
         result = dict(row.get("result") or {})
         return {
             "job_id": row["job_id"],
+            "site_id": row["site_id"],
             "status": row["status"],
             "url": row["url"],
             "created_at": row["created_at"],

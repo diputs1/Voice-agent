@@ -59,13 +59,15 @@ def finalize_streamed_answer(state: SafariState, answer: str) -> SafariState:
     if state.get("answer") and state.get("handoff_required"):
         return state
     if not is_grounded_quantitative_answer(answer, state.get("retrieved_context", [])):
-        return handoff_state(state, "ungrounded_answer")
+        return {**handoff_state(state, "ungrounded_answer"), "grounded": False, "evaluator_score": 0.0}
     return {
         "answer": answer,
         "citations": supporting_citations(answer, state.get("retrieved_context", [])),
         "handoff_required": False,
         "handoff_reason": None,
         "recommended_action": None,
+        "grounded": True,
+        "evaluator_score": 1.0,
     }
 
 

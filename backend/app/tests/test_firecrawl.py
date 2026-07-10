@@ -1,7 +1,7 @@
 import httpx
 import pytest
 
-from app.firecrawl import FirecrawlClient, firecrawl_result_to_chunks, scrape_result_to_chunks
+from app.crawling.firecrawl import FirecrawlClient, firecrawl_result_to_chunks, scrape_result_to_chunks
 
 
 @pytest.mark.asyncio

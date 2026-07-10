@@ -5,17 +5,17 @@ import uuid
 from collections.abc import AsyncIterator
 from typing import Any
 
-from app.agents.graph import SafariAgentGraph
-from app.cache import QACacheKey, TTLQACache, normalize_cache_query
-from app.kb import ChatKnowledgeStore
-from app.schemas import ChatRequest
+from app.agents.graphs import WebsiteAgentGraph
+from app.core.cache import QACacheKey, TTLQACache, normalize_cache_query
+from app.knowledge.kb import ChatKnowledgeStore
+from app.api.schemas import ChatRequest
 
 
 class ChatService:
     def __init__(
         self,
         *,
-        agent_graph: SafariAgentGraph,
+        agent_graph: WebsiteAgentGraph,
         kb: ChatKnowledgeStore,
         agent_semaphore,
         qa_cache: TTLQACache,
@@ -27,14 +27,17 @@ class ChatService:
 
     async def stream_chat(self, payload: ChatRequest) -> AsyncIterator[str]:
         thread_id = payload.thread_id or str(uuid.uuid4())
-        final_state: dict[str, Any] = {"transcript": payload.transcript}
-        doc_set_hash = await self.kb.doc_set_hash()
+        final_state: dict[str, Any] = {"transcript": payload.transcript, "site_id": payload.site_id}
+        try:
+            doc_set_hash = await self.kb.doc_set_hash(payload.site_id)
+        except TypeError:
+            doc_set_hash = await self.kb.doc_set_hash()
         cache_key: QACacheKey | None = None
         cached: dict[str, object] | None = None
 
         async with self.agent_semaphore:
             async for node_name, _, current_state in self.agent_graph.astream_pre_answer(
-                {"transcript": payload.transcript},
+                {"transcript": payload.transcript, "site_id": payload.site_id},
                 thread_id,
             ):
                 final_state = current_state
@@ -68,17 +71,30 @@ class ChatService:
                 await self.qa_cache.set(cache_key, qa_cache_payload(final_state))
 
             citations = final_state.get("citations", [])
-            await self.kb.save_thread_turn(thread_id, payload.transcript, answer)
+            try:
+                await self.kb.save_thread_turn(thread_id, payload.transcript, answer, payload.site_id)
+            except TypeError:
+                await self.kb.save_thread_turn(thread_id, payload.transcript, answer)
             yield sse(
                 "done",
                 {
                     "thread_id": thread_id,
+                    "site_id": payload.site_id,
+                    "graph_version": getattr(self.agent_graph, "graph_version", "website-agent-v1"),
+                    "agent_runtime_mode": "website",
                     "answer": answer,
                     "citations": citations,
                     "confidence": final_state.get("confidence", 0.0),
                     "handoff_required": final_state.get("handoff_required", False),
                     "handoff_reason": final_state.get("handoff_reason"),
                     "recommended_action": final_state.get("recommended_action"),
+                    "retrieval_debug": final_state.get("retrieval_debug", {}),
+                    "grounded": final_state.get("grounded", not final_state.get("handoff_required", False)),
+                    "evaluator_score": final_state.get("evaluator_score"),
+                    "crawl_version": final_state.get("crawl_version"),
+                    "freshness_status": final_state.get("freshness_status"),
+                    "agent_iteration_count": final_state.get("agent_iteration_count", 0),
+                    "tool_call_count": final_state.get("tool_call_count", 0),
                     "cache_hit": bool(cached),
                 },
             )
