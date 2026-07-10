@@ -1,3 +1,5 @@
+import pytest
+
 from app.crawling.link_discovery import LinkDiscoveryAgent, classify_url_category, normalize_url, skip_reason
 
 
@@ -23,7 +25,7 @@ def test_filters_allowed_and_skipped_urls():
     assert skip_reason("https://example.com/vi/vinpearl-safari-phu-quoc") == "external_domain"
 
 
-def test_discovers_firecrawl_links_and_falls_back_when_too_few_selected():
+def test_discovers_firecrawl_links_without_static_fallbacks():
     result = {
         "data": [
             {
@@ -43,10 +45,6 @@ def test_discovers_firecrawl_links_and_falls_back_when_too_few_selected():
 
     discovery = LinkDiscoveryAgent(
         seed_url="https://vinwonders.com/vi/vinpearl-safari-phu-quoc/",
-        fallback_urls=[
-            "https://vinwonders.com/vi/vinpearl-safari-phu-quoc-gia-ve-va-quy-dinh/",
-            "https://vinwonders.com/vi/uu-dai/vinwonders-uu-dai-15-hoi-vien-vinclub/",
-        ],
     ).discover_from_firecrawl_result(result)
 
     selected = {item.url: item for item in discovery.selected_urls}
@@ -56,7 +54,74 @@ def test_discovers_firecrawl_links_and_falls_back_when_too_few_selected():
         normalize_url("https://vinwonders.com/vi/wonderpedia/news/ra-mat-chuong-trinh-vinwonders-affiliate/")
         in selected
     )
-    assert normalize_url("https://vinwonders.com/vi/uu-dai/vinwonders-uu-dai-15-hoi-vien-vinclub/") in selected
-    assert selected[normalize_url("https://vinwonders.com/vi/uu-dai/vinwonders-uu-dai-15-hoi-vien-vinclub/")].discovery_source == "fallback"
     assert "https://vinwonders.com/ru/promotions" in discovery.skip_reasons
     assert "https://example.com/vi/vinpearl-safari-phu-quoc" in discovery.skip_reasons
+
+
+@pytest.mark.asyncio
+async def test_agent_scrapes_selected_links_and_expands_from_scraped_page():
+    result = {
+        "data": [
+            {
+                "links": [
+                    "https://vinwonders.com/vi/promotions/",
+                ],
+                "metadata": {
+                    "sourceURL": "https://vinwonders.com/vi/vinpearl-safari-phu-quoc/",
+                    "url": "https://vinwonders.com/vi/vinpearl-safari-phu-quoc/",
+                },
+            }
+        ]
+    }
+    scraper = FakeFirecrawlScraper(
+        {
+            "https://vinwonders.com/vi/promotions": {
+                "data": {
+                    "markdown": "# Promotions\nƯu đãi Safari.",
+                    "links": ["https://vinwonders.com/vi/uu-dai/vinwonders-uu-dai-15-hoi-vien-vinclub/"],
+                    "metadata": {
+                        "sourceURL": "https://vinwonders.com/vi/promotions/",
+                        "url": "https://vinwonders.com/vi/promotions/",
+                    },
+                }
+            },
+            "https://vinwonders.com/vi/uu-dai/vinwonders-uu-dai-15-hoi-vien-vinclub": {
+                "data": {
+                    "markdown": "# VinClub\nƯu đãi hội viên.",
+                    "links": [],
+                    "metadata": {
+                        "sourceURL": "https://vinwonders.com/vi/uu-dai/vinwonders-uu-dai-15-hoi-vien-vinclub/",
+                        "url": "https://vinwonders.com/vi/uu-dai/vinwonders-uu-dai-15-hoi-vien-vinclub/",
+                    },
+                }
+            },
+        }
+    )
+
+    discovery, scraped_pages = await LinkDiscoveryAgent(
+        seed_url="https://vinwonders.com/vi/vinpearl-safari-phu-quoc/",
+    ).discover_and_scrape(result, scraper, max_scrapes=2)
+
+    assert scraper.scraped_urls == [
+        "https://vinwonders.com/vi/promotions",
+        "https://vinwonders.com/vi/uu-dai/vinwonders-uu-dai-15-hoi-vien-vinclub",
+    ]
+    assert [page.discovered_url.url for page in scraped_pages] == scraper.scraped_urls
+    assert discovery.scraped_urls == scraper.scraped_urls
+    assert (
+        discovery.skip_reasons.get("https://vinwonders.com/vi/uu-dai/vinwonders-uu-dai-15-hoi-vien-vinclub")
+        is None
+    )
+    assert {
+        item.url: item.discovery_source for item in discovery.selected_urls
+    }["https://vinwonders.com/vi/uu-dai/vinwonders-uu-dai-15-hoi-vien-vinclub"] == "agent_scrape_links"
+
+
+class FakeFirecrawlScraper:
+    def __init__(self, responses):
+        self.responses = responses
+        self.scraped_urls = []
+
+    async def scrape(self, url):
+        self.scraped_urls.append(url)
+        return self.responses[url]

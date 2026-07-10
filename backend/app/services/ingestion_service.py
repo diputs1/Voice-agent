@@ -12,7 +12,7 @@ from app.crawling.jobs import CrawlJobStore
 from app.crawling.firecrawl import FirecrawlClient, firecrawl_result_to_chunks, scrape_result_to_chunks
 from app.crawling.ingestion import fetch_vinwonders_chunks
 from app.knowledge.kb import IngestionSink
-from app.crawling.link_discovery import LinkDiscoveryAgent, discovery_metadata_for, normalize_url
+from app.crawling.link_discovery import LinkDiscoveryAgent, discovery_metadata_for
 from app.api.schemas import CrawlJobResponse, CrawlRequest, IngestRequest
 from app.core.sites import canonical_root_url, site_id_for_url
 
@@ -216,20 +216,33 @@ class IngestionService:
             for item in firecrawl_result.get("data", [])
             if item.get("metadata")
         ]
-        discovered_set = {str(item) for item in discovered_urls if item}
-        normalized_discovered_set = {
-            normalized for item in discovered_set if (normalized := normalize_url(item))
-        }
-        errors: list[dict[str, str]] = []
-        scraped_count = 0
         allowed_domains = [urlparse(url).netloc.lower()]
-        discovery = LinkDiscoveryAgent(
+        discovery_agent = LinkDiscoveryAgent(
             seed_url=url,
-            fallback_urls=strategic_firecrawl_urls(url),
             allowed_domains=allowed_domains,
             include_subdomains=include_subdomains,
             exclude_patterns=exclude_patterns,
-        ).discover_from_firecrawl_result(firecrawl_result)
+        )
+
+        async def on_discovery_progress(update: dict[str, object]) -> None:
+            if not crawl_job_id:
+                return
+            await self.update_crawl_job(
+                crawl_job_id,
+                {
+                    "status": "scraping_discovered_urls",
+                    "updated_at": utc_now(),
+                    **update,
+                },
+            )
+
+        initial_completed = int(firecrawl_result.get("completed") or 0)
+        discovery, scraped_pages = await discovery_agent.discover_and_scrape(
+            firecrawl_result,
+            self.firecrawl_client,
+            max_scrapes=max(0, max_pages - initial_completed),
+            on_progress=on_discovery_progress,
+        )
         selected_urls = [item.url for item in discovery.selected_urls]
         selected_metadata = {
             discovered.url: discovery_metadata_for(discovered) for discovered in discovery.selected_urls
@@ -242,57 +255,26 @@ class IngestionService:
             url_metadata=selected_metadata,
         )
 
-        for discovered in discovery.selected_urls:
-            scrape_url = discovered.url
-            if scrape_url in normalized_discovered_set:
-                continue
-            try:
-                if crawl_job_id:
-                    await self.update_crawl_job(
-                        crawl_job_id,
-                        {
-                            "status": "scraping_discovered_urls",
-                            "updated_at": utc_now(),
-                            "current_scrape_url": scrape_url,
-                            "selected_urls": selected_urls,
-                            "candidate_urls": discovery.candidate_urls,
-                            "skipped_urls": discovery.skipped_urls,
-                            "skip_reasons": discovery.skip_reasons,
-                            "scraped_count": scraped_count,
-                        },
-                    )
-                scrape_result = await self.firecrawl_client.scrape(scrape_url)
-                scrape_chunks = scrape_result_to_chunks(
-                    result=scrape_result,
-                    seed_url=url,
-                    crawl_job_id=crawl_job_id,
-                    site_id=site_id,
-                    url_metadata={scrape_url: selected_metadata[scrape_url]},
-                )
-                if scrape_chunks:
-                    chunks.extend(scrape_chunks)
-                    discovered_urls.append(scrape_url)
-                    scraped_count += 1
-                    if crawl_job_id:
-                        await self.update_crawl_job(
-                            crawl_job_id,
-                            {
-                                "updated_at": utc_now(),
-                                "pages_crawled": int(firecrawl_result.get("completed") or 0)
-                                + scraped_count,
-                                "chunks_seen": len(chunks),
-                                "scraped_count": scraped_count,
-                            },
-                        )
-            except Exception as exc:
-                errors.append({"url": scrape_url, "error": str(exc)})
+        for page in scraped_pages:
+            scrape_url = page.discovered_url.url
+            scrape_chunks = scrape_result_to_chunks(
+                result=page.result,
+                seed_url=url,
+                crawl_job_id=crawl_job_id,
+                site_id=site_id,
+                url_metadata={scrape_url: discovery_metadata_for(page.discovered_url)},
+            )
+            if scrape_chunks:
+                chunks.extend(scrape_chunks)
+                discovered_urls.append(scrape_url)
                 if crawl_job_id:
                     await self.update_crawl_job(
                         crawl_job_id,
                         {
                             "updated_at": utc_now(),
-                            "pages_failed": len(errors),
-                            "errors": errors,
+                            "pages_crawled": initial_completed + len(discovery.scraped_urls),
+                            "chunks_seen": len(chunks),
+                            "scraped_count": len(discovery.scraped_urls),
                         },
                     )
 
@@ -301,10 +283,10 @@ class IngestionService:
             "started_at": firecrawl_result.get("createdAt"),
             "finished_at": firecrawl_result.get("completedAt"),
             "pages_seen": firecrawl_result.get("total", 0),
-            "pages_crawled": int(firecrawl_result.get("completed") or 0) + scraped_count,
-            "pages_failed": len(errors),
-            "credits_used": int(firecrawl_result.get("creditsUsed") or 0) + scraped_count,
-            "errors": errors,
+            "pages_crawled": initial_completed + len(discovery.scraped_urls),
+            "pages_failed": len(discovery.scrape_errors),
+            "credits_used": int(firecrawl_result.get("creditsUsed") or 0) + len(discovery.scraped_urls),
+            "errors": discovery.scrape_errors,
             "discovered_urls": discovered_urls,
             "candidate_urls": discovery.candidate_urls,
             "selected_urls": selected_urls,
@@ -319,24 +301,6 @@ class IngestionService:
 
 def utc_now() -> str:
     return datetime.now(UTC).isoformat()
-
-
-def strategic_firecrawl_urls(url: str) -> list[str]:
-    if "vinwonders.com" not in url:
-        return []
-    return [
-        "https://vinwonders.com/vi/vinpearl-safari-phu-quoc/",
-        "https://vinwonders.com/vi/vinpearl-safari-phu-quoc-gia-ve-va-quy-dinh/",
-        "https://vinwonders.com/vi/promotions/",
-        "https://vinwonders.com/vi/uu-dai/vinwonders-uu-dai-15-hoi-vien-vinclub/",
-        "https://vinwonders.com/vi/wonderpedia/news/ra-mat-chuong-trinh-vinwonders-affiliate/",
-        "https://vinwonders.com/vi/wonderpedia/news/gia-ve-vinpearl-safari-phu-quoc/",
-        "https://vinwonders.com/vi/wonderpedia/news/voucher-vinpearl-safari-phu-quoc/",
-        "https://vinwonders.com/en/vinpearl-safari-phu-quoc/",
-        "https://vinwonders.com/en/vinpearl-safari-phu-quoc-price-and-regulations/",
-        "https://vinwonders.com/en/promotions/",
-        "https://vinwonders.com/en/terms-and-conditions/",
-    ]
 
 
 def default_include_paths(url: str) -> list[str]:
