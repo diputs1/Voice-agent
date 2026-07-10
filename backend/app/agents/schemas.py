@@ -1,33 +1,13 @@
 from __future__ import annotations
 
-from typing import Any, Literal, TypedDict
+from typing import Literal
 
 from pydantic import BaseModel, Field
 
+from app.agents import state as agent_state
 
-class SafariState(TypedDict, total=False):
-    messages: list[dict[str, str]]
-    transcript: str
-    thread_history: list[dict[str, Any]]
-    search_query: str
-    rewrite_source: str
-    query_retry_count: int
-    retry_reason: str | None
-    intent: str
-    primary_intent: str
-    intent_entities: list[str]
-    supervisor_confidence: float
-    suggested_route: str
-    retrieved_context: list[dict[str, Any]]
-    answer: str
-    citations: list[dict[str, Any]]
-    confidence: float
-    classifier_confidence: float
-    classifier_source: str
-    handoff_required: bool
-    handoff_reason: str | None
-    recommended_action: str | None
-    route: str
+AgentState = agent_state.AgentState
+SafariState = agent_state.SafariState
 
 
 class SupervisorDecision(BaseModel):

@@ -3,7 +3,7 @@ from __future__ import annotations
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from app.config import get_settings
+from app.core.config import get_settings
 from app.routers import admin, chat, health
 from app.services.app_factory import initialize_app_state
 

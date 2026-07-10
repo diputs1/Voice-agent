@@ -8,7 +8,7 @@ from typing import Any
 
 import httpx
 
-from app.ingestion import (
+from app.crawling.ingestion import (
     IngestedChunk,
     classify_category,
     content_hash_for,
@@ -16,7 +16,8 @@ from app.ingestion import (
     _infer_language,
     _valid_until,
 )
-from app.link_discovery import normalize_url
+from app.crawling.link_discovery import normalize_url
+from app.core.sites import site_id_for_url
 
 
 @dataclass
@@ -45,6 +46,7 @@ class FirecrawlClient:
         limit: int,
         include_paths: list[str] | None = None,
         exclude_paths: list[str] | None = None,
+        allow_subdomains: bool = False,
     ) -> dict[str, Any]:
         payload: dict[str, Any] = {
             "url": url,
@@ -54,7 +56,7 @@ class FirecrawlClient:
             "sitemap": "include",
             "ignoreQueryParameters": True,
             "allowExternalLinks": False,
-            "allowSubdomains": True,
+            "allowSubdomains": allow_subdomains,
             "ignoreRobotsTxt": False,
             "scrapeOptions": {
                 "formats": ["markdown", "links"],
@@ -145,11 +147,13 @@ def firecrawl_result_to_chunks(
     result: dict[str, Any],
     seed_url: str,
     crawl_job_id: str | None,
+    site_id: str | None = None,
     url_metadata: dict[str, dict[str, Any]] | None = None,
 ) -> list[IngestedChunk]:
     pages = [_page_from_item(item) for item in result.get("data") or []]
     chunks: list[IngestedChunk] = []
     crawled_at = datetime.now(UTC)
+    resolved_site_id = site_id or site_id_for_url(seed_url)
     for page in pages:
         source_url = str(page.metadata.get("sourceURL") or page.metadata.get("url") or seed_url)
         canonical_url = str(page.metadata.get("url") or source_url)
@@ -160,6 +164,7 @@ def firecrawl_result_to_chunks(
             extracted = extract_structured_metadata(content)
             metadata = {
                 "crawl_job_id": crawl_job_id,
+                "site_id": resolved_site_id,
                 "seed_url": seed_url,
                 "canonical_url": canonical_url,
                 "source_type": "firecrawl",
@@ -185,6 +190,7 @@ def firecrawl_result_to_chunks(
                     valid_until=_valid_until(category, crawled_at),
                     language=_infer_language(canonical_url),
                     metadata={key: value for key, value in metadata.items() if value is not None},
+                    site_id=resolved_site_id,
                 )
             )
     return chunks
@@ -195,6 +201,7 @@ def scrape_result_to_chunks(
     result: dict[str, Any],
     seed_url: str,
     crawl_job_id: str | None,
+    site_id: str | None = None,
     url_metadata: dict[str, dict[str, Any]] | None = None,
 ) -> list[IngestedChunk]:
     data = result.get("data") or result
@@ -202,6 +209,7 @@ def scrape_result_to_chunks(
         result={"data": [data]},
         seed_url=seed_url,
         crawl_job_id=crawl_job_id,
+        site_id=site_id,
         url_metadata=url_metadata,
     )
 

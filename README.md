@@ -1,10 +1,10 @@
 # Vin Agent
 
-LangGraph-first voice Q&A MVP for Vinpearl Safari Phu Quoc.
+LangGraph-first voice Q&A backend for crawling a website into a knowledge base and answering by text/voice.
 
 ## Architecture
 
-- `backend/`: FastAPI + LangGraph orchestration, Firecrawl-powered VinWonders ingestion, pgvector knowledge base, ElevenLabs TTS/STT token endpoints.
+- `backend/`: FastAPI + LangGraph orchestration, Firecrawl-powered website ingestion, PostgreSQL/pgvector knowledge base, ElevenLabs TTS/STT token endpoints.
 - `frontend/`: Next.js voice chat UI using ElevenLabs Realtime STT.
 - `docker-compose.yml`: local PostgreSQL with pgvector.
 
@@ -35,11 +35,13 @@ pip install -e ".[dev]"
 uvicorn app.main:app --reload --port 8000
 ```
 
-4. Ingest VinWonders content:
+4. Crawl a website:
 
 ```bash
-curl -X POST http://localhost:8000/admin/ingest-vinwonders \
-  -H "X-Admin-API-Key: $ADMIN_API_KEY"
+curl -X POST http://localhost:8000/admin/crawl \
+  -H 'Content-Type: application/json' \
+  -H "X-Admin-API-Key: $ADMIN_API_KEY" \
+  -d '{"url":"https://example.com/","max_depth":3,"max_pages":100,"include_subdomains":false}'
 ```
 
 5. Install and run frontend:
@@ -83,7 +85,7 @@ Start a clean web crawl and ingest the returned Markdown into the KB:
 curl -X POST http://localhost:8000/admin/crawl \
   -H 'Content-Type: application/json' \
   -H "X-Admin-API-Key: $ADMIN_API_KEY" \
-  -d '{"url":"https://vinwonders.com/vi/vinpearl-safari-phu-quoc/","max_depth":2,"max_pages":40}'
+  -d '{"url":"https://vinwonders.com/vi/vinpearl-safari-phu-quoc/","max_depth":3,"max_pages":100,"include_subdomains":false,"exclude_patterns":[".*login.*"]}'
 ```
 
 Check job status:
@@ -93,11 +95,18 @@ curl http://localhost:8000/admin/crawl-jobs/<job_id> \
   -H "X-Admin-API-Key: $ADMIN_API_KEY"
 ```
 
+Check KB status for a site:
+
+```bash
+curl http://localhost:8000/admin/sites/<site_id>/status \
+  -H "X-Admin-API-Key: $ADMIN_API_KEY"
+```
+
 ## Lightweight eval
 
 Run the local seed-KB eval suite without external services:
 
 ```bash
 cd backend
-python -m app.evals.run_eval
+python -m app.evals.run_eval --graph compare --runs 3
 ```

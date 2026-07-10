@@ -7,9 +7,9 @@ from fastapi import BackgroundTasks
 from fastapi import HTTPException
 
 from app import main
-from app.cache import TTLQACache
+from app.core.cache import TTLQACache
 from app.routers import admin, chat, health
-from app.schemas import CrawlRequest
+from app.api.schemas import CrawlRequest
 from app.services.chat_service import ChatService
 from app.services.ingestion_service import IngestionService
 
@@ -204,7 +204,7 @@ class FakeAgentGraph:
 
 
 def _chat_request(transcript):
-    from app.schemas import ChatRequest
+    from app.api.schemas import ChatRequest
 
     return ChatRequest(transcript=transcript, thread_id="test-thread")
 

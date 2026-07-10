@@ -15,6 +15,7 @@ class Citation(BaseModel):
 class ChatRequest(BaseModel):
     transcript: str = Field(min_length=1)
     thread_id: str | None = None
+    site_id: str | None = None
 
 
 class TTSRequest(BaseModel):
@@ -29,11 +30,14 @@ class CrawlRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     url: HttpUrl
-    max_depth: int = Field(default=2, ge=0, le=4)
-    max_pages: int = Field(default=40, ge=1, le=100)
+    max_depth: int = Field(default=3, ge=0, le=8)
+    max_pages: int = Field(default=100, ge=1, le=1000)
+    include_subdomains: bool = False
+    exclude_patterns: list[str] = Field(default_factory=list)
 
 
 class CrawlJobResponse(BaseModel):
     job_id: str
     status: str
     url: str
+    site_id: str | None = None

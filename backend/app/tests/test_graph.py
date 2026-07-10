@@ -1,9 +1,9 @@
 import pytest
 
 from app.agents.graph import SafariAgentGraph
-from app.config import Settings
-from app.embeddings import EmbeddingProvider
-from app.kb import InMemoryKnowledgeBase, KnowledgeHit
+from app.core.config import Settings
+from app.knowledge.embeddings import EmbeddingProvider
+from app.knowledge.kb import InMemoryKnowledgeBase, KnowledgeHit
 
 
 @pytest.mark.asyncio

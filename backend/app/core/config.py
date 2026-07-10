@@ -25,6 +25,13 @@ class Settings(BaseSettings):
     agent_max_concurrency: int = Field(default=8, ge=1)
     qa_cache_ttl_seconds: int = Field(default=300, ge=0)
     qa_cache_max_entries: int = Field(default=256, ge=1)
+    agent_runtime_mode: str = Field(default="website")
+    full_agent_max_iterations: int = Field(default=4, ge=1)
+    full_agent_timeout_seconds: float = Field(default=6.0, gt=0)
+    langsmith_tracing: bool = False
+    langsmith_api_key: str | None = None
+    langsmith_project: str = "vin-agent"
+    langsmith_endpoint: str | None = None
 
     @property
     def cors_origin_list(self) -> list[str]:

@@ -26,9 +26,22 @@ class LinkDiscoveryResult:
 
 
 class LinkDiscoveryAgent:
-    def __init__(self, *, seed_url: str, fallback_urls: list[str] | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        seed_url: str,
+        fallback_urls: list[str] | None = None,
+        allowed_domains: list[str] | None = None,
+        include_subdomains: bool = False,
+        exclude_patterns: list[str] | None = None,
+    ) -> None:
         self.seed_url = normalize_url(seed_url) or seed_url
         self.fallback_urls = fallback_urls or []
+        parsed = urlparse(self.seed_url)
+        self._legacy_default_filter = allowed_domains is None and parsed.netloc.lower().endswith("vinwonders.com")
+        self.allowed_domains = [domain.lower() for domain in (allowed_domains or [parsed.netloc])]
+        self.include_subdomains = include_subdomains
+        self.exclude_patterns = exclude_patterns or []
 
     def discover_from_firecrawl_result(self, result: dict[str, Any]) -> LinkDiscoveryResult:
         discovery = LinkDiscoveryResult()
@@ -86,16 +99,17 @@ class LinkDiscoveryAgent:
         normalized = normalize_url(url)
         if not normalized:
             return
-        reason = skip_reason(normalized)
+        reason = skip_reason(
+            normalized,
+            allowed_domains=None if self._legacy_default_filter else self.allowed_domains,
+            include_subdomains=self.include_subdomains,
+            exclude_patterns=self.exclude_patterns,
+        )
         if reason:
             discovery.skipped_urls.append(normalized)
             discovery.skip_reasons[normalized] = reason
             return
-        category = classify_url_category(normalized)
-        if not category:
-            discovery.skipped_urls.append(normalized)
-            discovery.skip_reasons[normalized] = "not_relevant_to_vin_safari"
-            return
+        category = classify_url_category(normalized) or "page"
         if normalized not in selected:
             selected[normalized] = DiscoveredUrl(
                 url=normalized,
@@ -117,20 +131,33 @@ def normalize_url(url: str) -> str | None:
     return urlunparse((parsed.scheme.lower(), parsed.netloc.lower(), path, "", "", ""))
 
 
-def skip_reason(url: str) -> str | None:
+def skip_reason(
+    url: str,
+    *,
+    allowed_domains: list[str] | None = None,
+    include_subdomains: bool = True,
+    exclude_patterns: list[str] | None = None,
+) -> str | None:
     parsed = urlparse(url)
     host = parsed.netloc.lower()
     path = parsed.path.lower()
-    if not host.endswith("vinwonders.com"):
+    domains = [domain.lower() for domain in (allowed_domains or ["vinwonders.com"])]
+    if not _host_allowed(host, domains, include_subdomains):
         return "external_domain"
-    if re.search(r"\.(jpg|jpeg|png|gif|webp|svg|ico|css|js|mp4|mov|zip|pdf)$", path):
+    if re.search(r"\.(jpg|jpeg|png|gif|webp|svg|ico|css|js|mp4|mov|zip|pdf|woff2?|ttf|eot)$", path):
         return "static_asset"
-    if re.search(r"/(ko|zh|ru)(/|$)", path):
-        return "unsupported_language"
     if "login" in path or "dang-nhap" in path or "register" in path or "dang-ky" in path:
         return "auth_page"
-    if not re.search(r"/(vi|en)(/|$)", path):
-        return "unsupported_language"
+    if any(segment in path for segment in ("/cart", "/checkout", "/account", "/wp-admin")):
+        return "auth_or_transaction_page"
+    for pattern in exclude_patterns or []:
+        if re.search(pattern, url, flags=re.IGNORECASE):
+            return "excluded_by_policy"
+    if allowed_domains is None:
+        if re.search(r"/(ko|zh|ru)(/|$)", path):
+            return "unsupported_language"
+        if not re.search(r"/(vi|en)(/|$)", path):
+            return "unsupported_language"
     return None
 
 
@@ -174,3 +201,12 @@ def _category_rank(category: str) -> int:
         "service": 6,
     }
     return ranks.get(category, 99)
+
+
+def _host_allowed(host: str, domains: list[str], include_subdomains: bool) -> bool:
+    for domain in domains:
+        if host == domain:
+            return True
+        if include_subdomains and host.endswith(f".{domain}"):
+            return True
+    return False
