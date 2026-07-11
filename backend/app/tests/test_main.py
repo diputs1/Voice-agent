@@ -9,7 +9,7 @@ from fastapi import HTTPException
 from app import main
 from app.core.cache import TTLQACache
 from app.routers import admin, chat, health
-from app.api.schemas import CrawlRequest
+from app.api.schemas import CrawlRequest, TTSRequest
 from app.services.chat_service import ChatService
 from app.services.ingestion_service import IngestionService
 
@@ -140,6 +140,78 @@ async def test_chat_stream_uses_cached_answer_after_contextualized_query():
     assert kb.saved_turns == [
         ("test-thread", "Mở cửa mấy giờ?", "Câu trả lời từ graph."),
         ("test-thread", "Mở cửa mấy giờ?", "Câu trả lời từ graph."),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_text_to_speech_enforces_vietnamese_model_and_language(monkeypatch):
+    sent_requests = []
+    main.app.state.settings = SimpleNamespace(
+        elevenlabs_api_key="test-key",
+        elevenlabs_voice_id="test-voice",
+        elevenlabs_tts_model="eleven_flash_v2_5",
+        elevenlabs_tts_language_code="vi",
+    )
+
+    class FakeTTSResponse:
+        status_code = 200
+
+        async def aiter_bytes(self):
+            yield b"audio"
+
+    class FakeStream:
+        async def __aenter__(self):
+            return FakeTTSResponse()
+
+        async def __aexit__(self, exc_type, exc, traceback):
+            return None
+
+    class FakeAsyncClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, traceback):
+            return None
+
+        def stream(self, method, url, *, headers, json):
+            sent_requests.append(
+                {
+                    "method": method,
+                    "url": url,
+                    "headers": headers,
+                    "json": json,
+                }
+            )
+            return FakeStream()
+
+    monkeypatch.setattr(chat.httpx, "AsyncClient", FakeAsyncClient)
+
+    response = await chat.text_to_speech(_request(), TTSRequest(text="Xin chào quý khách."))
+    audio = b""
+    async for chunk in response.body_iterator:
+        audio += chunk
+
+    assert audio == b"audio"
+    assert sent_requests == [
+        {
+            "method": "POST",
+            "url": (
+                "https://api.elevenlabs.io/v1/text-to-speech/test-voice/stream"
+                "?output_format=mp3_44100_128"
+            ),
+            "headers": {
+                "xi-api-key": "test-key",
+                "Content-Type": "application/json",
+            },
+            "json": {
+                "text": "Xin chào quý khách.",
+                "model_id": "eleven_flash_v2_5",
+                "language_code": "vi",
+            },
+        }
     ]
 
 

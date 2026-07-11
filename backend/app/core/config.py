@@ -16,7 +16,8 @@ class Settings(BaseSettings):
     firecrawl_base_url: str = "https://api.firecrawl.dev"
     elevenlabs_api_key: str | None = None
     elevenlabs_voice_id: str = "JBFqnCBsd6RMkjVDRZzb"
-    elevenlabs_tts_model: str = "eleven_multilingual_v2"
+    elevenlabs_tts_model: str = "eleven_flash_v2_5"
+    elevenlabs_tts_language_code: str = "vi"
     vinwonders_source_url: str = "https://vinwonders.com/vi/vinpearl-safari-phu-quoc/"
     cors_origins: str = Field(default="http://localhost:3000")
     low_confidence_threshold: float = Field(default=0.70, ge=0.0, le=1.0)
