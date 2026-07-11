@@ -12,10 +12,11 @@ from app.agents.logic.query_rewrite import (
     parse_rewrite_payload,
 )
 from app.agents.schemas import SafariState
+from app.agents.state import AgentUpdate
 
 
 @traceable(name="graph.contextualize_query")
-async def contextualize_query_node(state: SafariState, llm) -> SafariState:
+async def contextualize_query_node(state: SafariState, llm) -> AgentUpdate:
     search_query, rewrite_source = await resolve_search_query(
         state.get("transcript", ""),
         state.get("thread_history", []),

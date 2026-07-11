@@ -9,10 +9,14 @@ from app.agents.logic.answer_grounding import HANDOFF_ACTIONS, parse_datetime
 from app.agents.logic.intent import TIME_SENSITIVE_CATEGORIES
 from app.agents.nodes.retry_query import MAX_RETRIEVAL_RETRIES
 from app.agents.schemas import SafariState
+from app.agents.state import AgentUpdate
 
 
 @traceable(name="graph.offer_freshness")
-async def offer_freshness_node(state: SafariState, low_confidence_threshold: float) -> SafariState:
+async def offer_freshness_node(
+    state: SafariState,
+    low_confidence_threshold: float,
+) -> AgentUpdate:
     now = datetime.now(UTC)
     handoff_required = False
     handoff_reason: str | None = None

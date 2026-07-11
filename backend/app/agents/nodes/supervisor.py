@@ -18,10 +18,11 @@ from app.agents.logic.intent import (
     supervisor_messages,
 )
 from app.agents.schemas import SafariState, SupervisorDecision
+from app.agents.state import AgentUpdate
 
 
 @traceable(name="graph.supervisor")
-async def supervisor_node(state: SafariState, llm) -> SafariState:
+async def supervisor_node(state: SafariState, llm) -> AgentUpdate:
     transcript = state.get("transcript", "")
     classifier_decision, source = await classify_intent(transcript, llm)
     route = route_from_decision(classifier_decision)

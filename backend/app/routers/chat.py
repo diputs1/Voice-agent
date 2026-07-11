@@ -48,7 +48,11 @@ async def text_to_speech(request: Request, payload: TTSRequest) -> StreamingResp
                     "xi-api-key": settings.elevenlabs_api_key or "",
                     "Content-Type": "application/json",
                 },
-                json={"text": payload.text, "model_id": settings.elevenlabs_tts_model},
+                json={
+                    "text": payload.text,
+                    "model_id": settings.elevenlabs_tts_model,
+                    "language_code": settings.elevenlabs_tts_language_code,
+                },
             ) as response:
                 if response.status_code >= 400:
                     detail = await response.aread()

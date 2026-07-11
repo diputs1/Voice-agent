@@ -47,4 +47,8 @@ class AgentState(RetrievalState, CrawlState, VoiceState, total=False):
     tool_call_count: int
 
 
+class AgentUpdate(AgentState, total=False):
+    pass
+
+
 SafariState = AgentState

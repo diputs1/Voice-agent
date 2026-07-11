@@ -5,12 +5,13 @@ import re
 from langsmith import traceable
 
 from app.agents.schemas import SafariState
+from app.agents.state import AgentUpdate
 
 MAX_RETRIEVAL_RETRIES = 1
 
 
 @traceable(name="graph.retry_query")
-async def retry_query_node(state: SafariState) -> SafariState:
+async def retry_query_node(state: SafariState) -> AgentUpdate:
     return {
         "search_query": expanded_search_query(state),
         "rewrite_source": "retry_expanded",
