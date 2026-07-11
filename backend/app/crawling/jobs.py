@@ -65,8 +65,8 @@ class PostgresCrawlJobStore:
         self.database_url = database_url
 
     async def ensure_ready(self) -> None:
-        with psycopg.connect(self.database_url, autocommit=True) as conn:
-            conn.execute(
+        async with await psycopg.AsyncConnection.connect(self.database_url, autocommit=True) as conn:
+            await conn.execute(
                 """
                 CREATE TABLE IF NOT EXISTS crawl_jobs (
                   job_id TEXT PRIMARY KEY,
@@ -80,11 +80,11 @@ class PostgresCrawlJobStore:
                 )
                 """
             )
-            conn.execute("ALTER TABLE crawl_jobs ADD COLUMN IF NOT EXISTS site_id TEXT")
-            conn.execute(
+            await conn.execute("ALTER TABLE crawl_jobs ADD COLUMN IF NOT EXISTS site_id TEXT")
+            await conn.execute(
                 "CREATE INDEX IF NOT EXISTS crawl_jobs_status_idx ON crawl_jobs (status, updated_at DESC)"
             )
-            conn.execute("CREATE INDEX IF NOT EXISTS crawl_jobs_site_idx ON crawl_jobs (site_id, updated_at DESC)")
+            await conn.execute("CREATE INDEX IF NOT EXISTS crawl_jobs_site_idx ON crawl_jobs (site_id, updated_at DESC)")
 
     async def create(
         self,
@@ -97,8 +97,8 @@ class PostgresCrawlJobStore:
         status = str(initial.get("status") or "queued")
         site_id = initial.get("site_id")
         result = {key: value for key, value in initial.items() if key not in {"job_id", "status", "url"}}
-        with psycopg.connect(self.database_url, autocommit=True) as conn:
-            conn.execute(
+        async with await psycopg.AsyncConnection.connect(self.database_url, autocommit=True) as conn:
+            await conn.execute(
                 """
                 INSERT INTO crawl_jobs (job_id, site_id, status, url, payload, result)
                 VALUES (%s, %s, %s, %s, %s::jsonb, %s::jsonb)
@@ -132,8 +132,8 @@ class PostgresCrawlJobStore:
             for key, value in {**current, **updates}.items()
             if key not in {"job_id", "status", "url", "payload"}
         }
-        with psycopg.connect(self.database_url, autocommit=True) as conn:
-            conn.execute(
+        async with await psycopg.AsyncConnection.connect(self.database_url, autocommit=True) as conn:
+            await conn.execute(
                 """
                 UPDATE crawl_jobs
                 SET site_id = %s, status = %s, url = %s, result = %s::jsonb, updated_at = now()
@@ -143,15 +143,16 @@ class PostgresCrawlJobStore:
             )
 
     async def get(self, job_id: str) -> dict[str, Any] | None:
-        with psycopg.connect(self.database_url, row_factory=dict_row) as conn:
-            row = conn.execute(
+        async with await psycopg.AsyncConnection.connect(self.database_url, row_factory=dict_row) as conn:
+            cursor = await conn.execute(
                 """
                 SELECT job_id, site_id, status, url, payload, result, created_at::text, updated_at::text
                 FROM crawl_jobs
                 WHERE job_id = %s
                 """,
                 (job_id,),
-            ).fetchone()
+            )
+            row = await cursor.fetchone()
         if not row:
             return None
         result = dict(row.get("result") or {})

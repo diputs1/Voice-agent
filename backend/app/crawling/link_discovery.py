@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Awaitable, Callable, Protocol
 from urllib.parse import urlparse, urlunparse
 
 
@@ -23,6 +23,21 @@ class LinkDiscoveryResult:
     selected_urls: list[DiscoveredUrl] = field(default_factory=list)
     skipped_urls: list[str] = field(default_factory=list)
     skip_reasons: dict[str, str] = field(default_factory=dict)
+    scraped_urls: list[str] = field(default_factory=list)
+    scrape_errors: list[dict[str, str]] = field(default_factory=list)
+
+
+@dataclass(frozen=True)
+class ScrapedDiscoveryPage:
+    discovered_url: DiscoveredUrl
+    result: dict[str, Any]
+
+
+class FirecrawlScraper(Protocol):
+    async def scrape(self, url: str) -> dict[str, Any]: ...
+
+
+DiscoveryProgressCallback = Callable[[dict[str, Any]], Awaitable[None]]
 
 
 class LinkDiscoveryAgent:
@@ -30,13 +45,11 @@ class LinkDiscoveryAgent:
         self,
         *,
         seed_url: str,
-        fallback_urls: list[str] | None = None,
         allowed_domains: list[str] | None = None,
         include_subdomains: bool = False,
         exclude_patterns: list[str] | None = None,
     ) -> None:
         self.seed_url = normalize_url(seed_url) or seed_url
-        self.fallback_urls = fallback_urls or []
         parsed = urlparse(self.seed_url)
         self._legacy_default_filter = allowed_domains is None and parsed.netloc.lower().endswith("vinwonders.com")
         self.allowed_domains = [domain.lower() for domain in (allowed_domains or [parsed.netloc])]
@@ -58,21 +71,60 @@ class LinkDiscoveryAgent:
                 discovery_source="firecrawl_links",
             )
 
-        if len(selected) < MIN_SELECTED_URLS:
-            for url in self.fallback_urls:
+        discovery.selected_urls = sorted_selected_urls(selected)
+        return discovery
+
+    async def discover_and_scrape(
+        self,
+        initial_result: dict[str, Any],
+        scraper: FirecrawlScraper,
+        *,
+        max_scrapes: int,
+        on_progress: DiscoveryProgressCallback | None = None,
+    ) -> tuple[LinkDiscoveryResult, list[ScrapedDiscoveryPage]]:
+        discovery = self.discover_from_firecrawl_result(initial_result)
+        selected = {item.url: item for item in discovery.selected_urls}
+        already_crawled = self._source_urls_from_result(initial_result)
+        visited = set(already_crawled)
+        scraped_pages: list[ScrapedDiscoveryPage] = []
+
+        while len(scraped_pages) < max_scrapes:
+            next_url = self._next_url_to_scrape(selected, visited)
+            if not next_url:
+                break
+            visited.add(next_url.url)
+
+            if on_progress:
+                await on_progress(
+                    {
+                        "current_scrape_url": next_url.url,
+                        "candidate_urls": discovery.candidate_urls,
+                        "selected_urls": [item.url for item in sorted_selected_urls(selected)],
+                        "skipped_urls": discovery.skipped_urls,
+                        "skip_reasons": discovery.skip_reasons,
+                        "scraped_count": len(scraped_pages),
+                    }
+                )
+
+            try:
+                scrape_result = await scraper.scrape(next_url.url)
+            except Exception as exc:
+                discovery.scrape_errors.append({"url": next_url.url, "error": str(exc)})
+                continue
+
+            discovery.scraped_urls.append(next_url.url)
+            scraped_pages.append(ScrapedDiscoveryPage(discovered_url=next_url, result=scrape_result))
+            for url, discovered_from in self._candidates_from_scrape_result(scrape_result).items():
                 self._consider_url(
                     discovery=discovery,
                     selected=selected,
                     url=url,
-                    discovered_from=self.seed_url,
-                    discovery_source="fallback",
+                    discovered_from=discovered_from or next_url.url,
+                    discovery_source="agent_scrape_links",
                 )
+            discovery.selected_urls = sorted_selected_urls(selected)
 
-        discovery.selected_urls = sorted(
-            selected.values(),
-            key=lambda item: (_category_rank(item.category), item.url),
-        )
-        return discovery
+        return discovery, scraped_pages
 
     def _candidates_from_result(self, result: dict[str, Any]) -> dict[str, str | None]:
         candidates: dict[str, str | None] = {}
@@ -86,6 +138,30 @@ class LinkDiscoveryAgent:
                 if normalized:
                     candidates.setdefault(normalized, source_url or self.seed_url)
         return candidates
+
+    def _candidates_from_scrape_result(self, result: dict[str, Any]) -> dict[str, str | None]:
+        data = result.get("data") or result
+        return self._candidates_from_result({"data": [data]})
+
+    def _source_urls_from_result(self, result: dict[str, Any]) -> set[str]:
+        urls = set()
+        for item in result.get("data") or []:
+            metadata = dict(item.get("metadata") or {})
+            for key in ("sourceURL", "url"):
+                normalized = normalize_url(str(metadata.get(key) or ""))
+                if normalized:
+                    urls.add(normalized)
+        return urls
+
+    def _next_url_to_scrape(
+        self,
+        selected: dict[str, DiscoveredUrl],
+        visited: set[str],
+    ) -> DiscoveredUrl | None:
+        for item in sorted_selected_urls(selected):
+            if item.url not in visited:
+                return item
+        return None
 
     def _consider_url(
         self,
@@ -188,6 +264,13 @@ def discovery_metadata_for(discovered: DiscoveredUrl) -> dict[str, str]:
     if discovered.discovered_from:
         metadata["discovered_from"] = discovered.discovered_from
     return metadata
+
+
+def sorted_selected_urls(selected: dict[str, DiscoveredUrl]) -> list[DiscoveredUrl]:
+    return sorted(
+        selected.values(),
+        key=lambda item: (_category_rank(item.category), item.url),
+    )
 
 
 def _category_rank(category: str) -> int:

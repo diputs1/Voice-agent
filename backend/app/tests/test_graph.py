@@ -34,7 +34,8 @@ async def test_ticket_price_question_requires_handoff():
 
     assert result["intent"] == "time_sensitive"
     assert result["primary_intent"] == "ticket_price"
-    assert result["suggested_route"] == "direct_handoff"
+    assert result["suggested_route"] == "safari_knowledge"
+    assert result["retrieval_debug"]["candidate_count"] > 0
     assert result["handoff_required"] is True
     assert result["handoff_reason"] == "stale_or_missing_time_sensitive_data"
     assert result["recommended_action"] == "contact_hotline_or_booking"
@@ -47,6 +48,7 @@ async def test_ticket_price_question_requires_handoff():
     [
         "Vé vào cổng bao nhiêu tiền?",
         "Hiện còn khuyến mãi không?",
+        "Có những voucher nào cho VinWonders?",
         "Cuối tuần này có áp dụng không?",
     ],
 )
@@ -61,7 +63,8 @@ async def test_paraphrased_time_sensitive_questions_use_rules_fast_path(question
 
     assert result["intent"] == "time_sensitive"
     assert result["classifier_source"] == "rules"
-    assert result["suggested_route"] == "direct_handoff"
+    assert result["suggested_route"] == "safari_knowledge"
+    assert result["retrieval_debug"]["candidate_count"] > 0
     assert result["handoff_required"] is True
 
 
@@ -91,6 +94,8 @@ async def test_llm_classifier_fallback_marks_time_sensitive_question():
     assert result["primary_intent"] == "ticket_price"
     assert result["classifier_source"] == "llm_json"
     assert result["classifier_confidence"] == 0.91
+    assert result["suggested_route"] == "safari_knowledge"
+    assert result["retrieval_debug"]["candidate_count"] > 0
     assert result["handoff_required"] is True
 
 
@@ -326,9 +331,9 @@ async def test_supervisor_classifies_domain_primary_intents():
 
 
 @pytest.mark.asyncio
-async def test_streaming_pre_answer_uses_direct_handoff_for_ticket_price():
+async def test_streaming_pre_answer_searches_before_handoff_for_ticket_price():
     settings = Settings(openai_api_key=None)
-    kb = FailIfSearchKnowledgeBase(EmbeddingProvider(None, "text-embedding-3-small"))
+    kb = RecordingKnowledgeBase(EmbeddingProvider(None, "text-embedding-3-small"))
     await kb.ensure_ready()
     graph = SafariAgentGraph(kb, settings)
 
@@ -341,7 +346,14 @@ async def test_streaming_pre_answer_uses_direct_handoff_for_ticket_price():
         nodes.append(node_name)
         final_state = current_state
 
-    assert nodes == ["supervisor", "direct_handoff"]
+    assert nodes == [
+        "supervisor",
+        "contextualize_query",
+        "safari_knowledge",
+        "offer_freshness",
+        "escalation",
+    ]
+    assert kb.last_query == "Giá vé hôm nay bao nhiêu?"
     assert final_state["handoff_required"] is True
 
 

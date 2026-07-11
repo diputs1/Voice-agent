@@ -62,7 +62,7 @@ async def classify_intent(transcript: str, llm) -> tuple[SupervisorDecision, str
                 True,
                 matched_keywords(lowered, TIME_SENSITIVE_KEYWORDS),
                 1.0,
-                "direct_handoff",
+                "safari_knowledge",
             ),
             "rules",
         )
