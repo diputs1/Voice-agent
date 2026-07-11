@@ -51,6 +51,21 @@ def test_safari_show_chunk_beats_other_show_chunk():
     assert _adjusted_score(query, safari_row, 0.1) > _adjusted_score(query, other_show_row, 0.4)
 
 
+def test_site_aliases_boost_matching_site_content():
+    row = {
+        "site_id": "custom-site",
+        "site_aliases": ["custom park"],
+        "title": "Custom Park",
+        "section": "Bảng giá",
+        "category": "price",
+        "content": "Giá vé Custom Park áp dụng trong ngày.",
+        "source_url": "https://example.test/custom-park/",
+        "language": "vi",
+    }
+
+    assert _adjusted_score("giá vé custom park", row, 0.1) > 1.0
+
+
 def test_diversify_categories_does_not_duplicate_extra_picks():
     rows = [
         (1.0, {"id": "price-1", "category": "price"}),
@@ -80,6 +95,21 @@ def test_rrf_fuse_deduplicates_and_preserves_confidence_score():
 
     assert ids.count("same") == 1
     assert next(item[1] for item in fused if item[1]["id"] == "same")["score"] == 0.2
+
+
+def test_rrf_fuse_orders_by_adjusted_confidence_before_fusion_score():
+    high_confidence = {"id": "safari-price", "category": "price", "score": 0.85}
+    low_confidence = {"id": "off-topic-price", "category": "price", "score": 0.1}
+
+    fused = _rrf_fuse(
+        [(0.85, high_confidence, 0.85), (0.1, low_confidence, 0.1)],
+        [(0.1, low_confidence, 0.1)],
+        limit=10,
+    )
+
+    assert [row["id"] for _, row in fused[:2]] == ["safari-price", "off-topic-price"]
+    assert fused[0][0] == fused[0][1]["score"] == 0.85
+    assert fused[1][1]["fusion_score"] > fused[0][1]["fusion_score"]
 
 
 @pytest.mark.asyncio

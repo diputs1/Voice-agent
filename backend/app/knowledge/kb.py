@@ -15,7 +15,18 @@ from langsmith import traceable
 
 from app.knowledge.embeddings import EmbeddingProvider, pgvector_literal
 from app.crawling.ingestion import IngestedChunk, seed_chunks
-from app.core.sites import canonical_root_url, site_id_for_url
+from app.core.sites import canonical_root_url, relevance_profile_for_text, site_id_for_url
+
+
+CATEGORY_KEYWORDS = {
+    "affiliate": ("affiliate", "hoa hồng", "đối tác"),
+    "vinclub": ("vinclub", "hội viên", "gold", "platinum", "diamond"),
+    "offer": ("ưu đãi", "voucher", "khuyến mãi", "giảm", "hạn áp dụng"),
+    "price": ("giá", "giá vé", "bảng giá", "vnđ", "vnd"),
+    "booking": ("booking", "đặt vé", "đặt online", "qr"),
+    "schedule": ("giờ", "mở cửa", "lịch", "lúc nào", "thời gian"),
+    "experience": ("show", "biểu diễn", "động vật", "animal", "night safari", "kid zoo"),
+}
 
 
 @dataclass
@@ -117,7 +128,8 @@ class InMemoryKnowledgeBase:
             lexical = _lexical_score(query, row)
             vector_ranked.append((confidence, row, confidence))
             if lexical > 0:
-                lexical_ranked.append((lexical, row, confidence))
+                lexical_confidence = _confidence_with_lexical_score(confidence, lexical)
+                lexical_ranked.append((lexical_confidence, row, lexical_confidence))
         fused = _rrf_fuse(vector_ranked, lexical_ranked, limit=max(limit * 6, 20))
         scored = _diversify_categories(query, fused, limit)
         return [
@@ -167,12 +179,14 @@ class InMemoryKnowledgeBase:
         site_id: str,
         root_url: str,
         allowed_domains: list[str],
+        site_aliases: list[str] | None = None,
         crawl_policy: dict | None = None,
     ) -> None:
         self.sites[site_id] = {
             "site_id": site_id,
             "root_url": root_url,
             "allowed_domains": allowed_domains,
+            "site_aliases": site_aliases or [],
             "crawl_policy": crawl_policy or {},
             "created_at": self.sites.get(site_id, {}).get("created_at") or datetime.now(UTC).isoformat(),
             "updated_at": datetime.now(UTC).isoformat(),
@@ -199,22 +213,23 @@ class PostgresKnowledgeBase:
         self.embeddings = embeddings
 
     async def ensure_ready(self) -> None:
-        with psycopg.connect(self.database_url, autocommit=True) as conn:
-            conn.execute("CREATE EXTENSION IF NOT EXISTS pgcrypto")
-            conn.execute("CREATE EXTENSION IF NOT EXISTS vector")
-            conn.execute(
+        async with await psycopg.AsyncConnection.connect(self.database_url, autocommit=True) as conn:
+            await conn.execute("CREATE EXTENSION IF NOT EXISTS pgcrypto")
+            await conn.execute("CREATE EXTENSION IF NOT EXISTS vector")
+            await conn.execute(
                 """
                 CREATE TABLE IF NOT EXISTS sites (
                   site_id TEXT PRIMARY KEY,
                   root_url TEXT NOT NULL,
                   allowed_domains TEXT[] NOT NULL DEFAULT ARRAY[]::text[],
+                  site_aliases TEXT[] NOT NULL DEFAULT ARRAY[]::text[],
                   crawl_policy JSONB NOT NULL DEFAULT '{}'::jsonb,
                   created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
                   updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
                 )
                 """
             )
-            conn.execute(
+            await conn.execute(
                 """
                 CREATE TABLE IF NOT EXISTS documents (
                   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -234,18 +249,21 @@ class PostgresKnowledgeBase:
                 )
                 """
             )
-            conn.execute("ALTER TABLE documents ADD COLUMN IF NOT EXISTS site_id TEXT NOT NULL DEFAULT 'default'")
-            conn.execute("ALTER TABLE documents ADD COLUMN IF NOT EXISTS canonical_url TEXT")
-            conn.execute("ALTER TABLE documents DROP CONSTRAINT IF EXISTS documents_content_hash_key")
-            conn.execute("ALTER TABLE documents ADD COLUMN IF NOT EXISTS search_text TEXT NOT NULL DEFAULT ''")
-            conn.execute(
+            await conn.execute(
+                "ALTER TABLE sites ADD COLUMN IF NOT EXISTS site_aliases TEXT[] NOT NULL DEFAULT ARRAY[]::text[]"
+            )
+            await conn.execute("ALTER TABLE documents ADD COLUMN IF NOT EXISTS site_id TEXT NOT NULL DEFAULT 'default'")
+            await conn.execute("ALTER TABLE documents ADD COLUMN IF NOT EXISTS canonical_url TEXT")
+            await conn.execute("ALTER TABLE documents DROP CONSTRAINT IF EXISTS documents_content_hash_key")
+            await conn.execute("ALTER TABLE documents ADD COLUMN IF NOT EXISTS search_text TEXT NOT NULL DEFAULT ''")
+            await conn.execute(
                 """
                 ALTER TABLE documents
                 ADD COLUMN IF NOT EXISTS search_vector tsvector
                 GENERATED ALWAYS AS (to_tsvector('simple', search_text)) STORED
                 """
             )
-            conn.execute(
+            await conn.execute(
                 """
                 CREATE TABLE IF NOT EXISTS thread_turns (
                   id BIGSERIAL PRIMARY KEY,
@@ -257,8 +275,8 @@ class PostgresKnowledgeBase:
                 )
                 """
             )
-            conn.execute("ALTER TABLE thread_turns ADD COLUMN IF NOT EXISTS site_id TEXT")
-            conn.execute(
+            await conn.execute("ALTER TABLE thread_turns ADD COLUMN IF NOT EXISTS site_id TEXT")
+            await conn.execute(
                 """
                 CREATE TABLE IF NOT EXISTS eval_runs (
                   run_id TEXT PRIMARY KEY,
@@ -269,30 +287,36 @@ class PostgresKnowledgeBase:
                 )
                 """
             )
-            conn.execute(
+            await conn.execute(
                 "CREATE UNIQUE INDEX IF NOT EXISTS documents_site_content_hash_idx ON documents (site_id, content_hash)"
             )
-            conn.execute("CREATE INDEX IF NOT EXISTS documents_site_idx ON documents (site_id)")
-            conn.execute(
-                "CREATE INDEX IF NOT EXISTS documents_embedding_idx ON documents USING ivfflat (embedding vector_cosine_ops)"
-            )
-            conn.execute(
+            await conn.execute("CREATE INDEX IF NOT EXISTS documents_site_idx ON documents (site_id)")
+            await conn.execute(
                 "CREATE INDEX IF NOT EXISTS documents_metadata_idx ON documents USING gin (metadata)"
             )
-            conn.execute(
+            await conn.execute(
                 "CREATE INDEX IF NOT EXISTS documents_search_vector_idx ON documents USING gin (search_vector)"
             )
-            self._backfill_search_text(conn)
+            await self._backfill_search_text(conn)
+            await self._ensure_vector_index(conn)
 
     async def upsert_chunks(self, chunks: list[IngestedChunk]) -> int:
         vectors = await self.embeddings.embed_documents([chunk.content for chunk in chunks])
         inserted = 0
-        with psycopg.connect(self.database_url, autocommit=True) as conn:
-            for chunk, vector in zip(chunks, vectors, strict=True):
-                chunk_site_id = chunk.site_id or site_id_for_url(chunk.source_url)
+        site_sources: dict[str, str] = {}
+        prepared_rows = []
+        for chunk, vector in zip(chunks, vectors, strict=True):
+            chunk_site_id = chunk.site_id or site_id_for_url(chunk.source_url)
+            site_sources.setdefault(chunk_site_id, chunk.source_url)
+            prepared_rows.append((chunk_site_id, chunk, vector))
+
+        async with await psycopg.AsyncConnection.connect(self.database_url, autocommit=True) as conn:
+            for chunk_site_id, source_url in site_sources.items():
+                await self._upsert_site_for_chunk(conn, chunk_site_id, source_url)
+
+            for chunk_site_id, chunk, vector in prepared_rows:
                 canonical_url = (chunk.metadata or {}).get("canonical_url") or chunk.source_url
-                self._upsert_site_for_chunk(conn, chunk_site_id, chunk.source_url)
-                result = conn.execute(
+                cursor = await conn.execute(
                     """
                     INSERT INTO documents (
                       site_id, source_url, canonical_url, title, section, category, content, content_hash,
@@ -318,48 +342,57 @@ class PostgresKnowledgeBase:
                         pgvector_literal(vector),
                         _search_text(asdict(chunk)),
                     ),
-                ).fetchone()
+                )
+                result = await cursor.fetchone()
                 if result:
                     inserted += 1
+            if inserted:
+                await self._ensure_vector_index(conn)
         return inserted
 
     @traceable(name="kb.postgres_search")
     async def search(self, query: str, limit: int = 5, site_id: str | None = None) -> list[KnowledgeHit]:
         vector = await self.embeddings.embed_query(query)
         query_text = _normalize_text(query)
-        site_filter = "WHERE site_id = %s" if site_id else ""
-        with psycopg.connect(self.database_url, row_factory=dict_row) as conn:
-            vector_rows = conn.execute(
+        site_filter = "WHERE d.site_id = %s" if site_id else ""
+        async with await psycopg.AsyncConnection.connect(self.database_url, row_factory=dict_row) as conn:
+            vector_cursor = await conn.execute(
                 f"""
-                SELECT id::text, site_id, title, section, category, content, source_url, language,
-                       crawled_at::text, valid_until::text, metadata,
-                       1 - (embedding <=> %s::vector) AS score
-                FROM documents
+                SELECT d.id::text, d.site_id, d.title, d.section, d.category, d.content,
+                       d.source_url, d.language, d.crawled_at::text, d.valid_until::text,
+                       d.metadata, COALESCE(s.site_aliases, ARRAY[]::text[]) AS site_aliases,
+                       1 - (d.embedding <=> %s::vector) AS score
+                FROM documents d
+                LEFT JOIN sites s ON s.site_id = d.site_id
                 {site_filter}
-                ORDER BY embedding <=> %s::vector
+                ORDER BY d.embedding <=> %s::vector
                 LIMIT %s
                 """,
                 (pgvector_literal(vector), site_id, pgvector_literal(vector), max(limit * 6, 20))
                 if site_id
                 else (pgvector_literal(vector), pgvector_literal(vector), max(limit * 6, 20)),
-            ).fetchall()
+            )
+            vector_rows = await vector_cursor.fetchall()
             lexical_rows = []
             if query_text:
-                lexical_rows = conn.execute(
+                lexical_cursor = await conn.execute(
                     f"""
-                    SELECT id::text, site_id, title, section, category, content, source_url, language,
-                           crawled_at::text, valid_until::text, metadata,
-                           ts_rank_cd(search_vector, websearch_to_tsquery('simple', %s)) AS lexical_score,
-                           1 - (embedding <=> %s::vector) AS score
-                    FROM documents
-                    WHERE {'site_id = %s AND ' if site_id else ''}search_vector @@ websearch_to_tsquery('simple', %s)
+                    SELECT d.id::text, d.site_id, d.title, d.section, d.category, d.content,
+                           d.source_url, d.language, d.crawled_at::text, d.valid_until::text,
+                           d.metadata, COALESCE(s.site_aliases, ARRAY[]::text[]) AS site_aliases,
+                           ts_rank_cd(d.search_vector, websearch_to_tsquery('simple', %s)) AS lexical_score,
+                           1 - (d.embedding <=> %s::vector) AS score
+                    FROM documents d
+                    LEFT JOIN sites s ON s.site_id = d.site_id
+                    WHERE {'d.site_id = %s AND ' if site_id else ''}d.search_vector @@ websearch_to_tsquery('simple', %s)
                     ORDER BY lexical_score DESC
                     LIMIT %s
                     """,
                     (query_text, pgvector_literal(vector), site_id, query_text, max(limit * 6, 20))
                     if site_id
                     else (query_text, pgvector_literal(vector), query_text, max(limit * 6, 20)),
-                ).fetchall()
+                )
+                lexical_rows = await lexical_cursor.fetchall()
         vector_ranked = []
         for row in vector_rows:
             item = dict(row)
@@ -369,7 +402,11 @@ class PostgresKnowledgeBase:
         for row in lexical_rows:
             item = dict(row)
             confidence = _adjusted_score(query, item, float(item["score"]))
-            lexical_ranked.append((float(item["lexical_score"]), item, confidence))
+            lexical_confidence = _confidence_with_lexical_score(
+                confidence,
+                float(item["lexical_score"]),
+            )
+            lexical_ranked.append((lexical_confidence, item, lexical_confidence))
         fused = _rrf_fuse(vector_ranked, lexical_ranked, limit=max(limit * 6, 20))
         reranked = [row for _, row in _diversify_categories(query, fused, limit)]
         return [_knowledge_hit_from_row(row) for row in reranked[:limit]]
@@ -377,37 +414,38 @@ class PostgresKnowledgeBase:
     async def save_thread_turn(
         self, thread_id: str, transcript: str, answer: str, site_id: str | None = None
     ) -> None:
-        with psycopg.connect(self.database_url, autocommit=True) as conn:
-            conn.execute(
+        async with await psycopg.AsyncConnection.connect(self.database_url, autocommit=True) as conn:
+            await conn.execute(
                 "INSERT INTO thread_turns (thread_id, site_id, transcript, answer) VALUES (%s, %s, %s, %s)",
                 (thread_id, site_id, transcript, answer),
             )
 
     async def get_thread(self, thread_id: str) -> list[dict]:
-        with psycopg.connect(self.database_url, row_factory=dict_row) as conn:
-            return list(
-                conn.execute(
-                    """
-                    SELECT site_id, transcript, answer, created_at::text
-                    FROM thread_turns
-                    WHERE thread_id = %s
-                    ORDER BY created_at ASC, id ASC
-                    """,
-                    (thread_id,),
-                ).fetchall()
+        async with await psycopg.AsyncConnection.connect(self.database_url, row_factory=dict_row) as conn:
+            cursor = await conn.execute(
+                """
+                SELECT site_id, transcript, answer, created_at::text
+                FROM thread_turns
+                WHERE thread_id = %s
+                ORDER BY created_at ASC, id ASC
+                """,
+                (thread_id,),
             )
+            rows = await cursor.fetchall()
+            return list(rows)
 
     async def doc_set_hash(self, site_id: str | None = None) -> str:
-        with psycopg.connect(self.database_url) as conn:
-            value = conn.execute(
+        async with await psycopg.AsyncConnection.connect(self.database_url) as conn:
+            cursor = await conn.execute(
                 f"""
                 SELECT md5(coalesce(string_agg(content_hash, ',' ORDER BY content_hash), ''))
                 FROM documents
                 {'WHERE site_id = %s' if site_id else ''}
-                """
-                ,
+                """,
                 (site_id,) if site_id else (),
-            ).fetchone()[0]
+            )
+            row = await cursor.fetchone()
+            value = row[0]
         return str(value)
 
     async def upsert_site(
@@ -416,16 +454,18 @@ class PostgresKnowledgeBase:
         site_id: str,
         root_url: str,
         allowed_domains: list[str],
+        site_aliases: list[str] | None = None,
         crawl_policy: dict | None = None,
     ) -> None:
-        with psycopg.connect(self.database_url, autocommit=True) as conn:
-            conn.execute(
+        async with await psycopg.AsyncConnection.connect(self.database_url, autocommit=True) as conn:
+            await conn.execute(
                 """
-                INSERT INTO sites (site_id, root_url, allowed_domains, crawl_policy)
-                VALUES (%s, %s, %s, %s::jsonb)
+                INSERT INTO sites (site_id, root_url, allowed_domains, site_aliases, crawl_policy)
+                VALUES (%s, %s, %s, %s, %s::jsonb)
                 ON CONFLICT (site_id) DO UPDATE SET
                   root_url = EXCLUDED.root_url,
                   allowed_domains = EXCLUDED.allowed_domains,
+                  site_aliases = EXCLUDED.site_aliases,
                   crawl_policy = EXCLUDED.crawl_policy,
                   updated_at = now()
                 """,
@@ -433,22 +473,25 @@ class PostgresKnowledgeBase:
                     site_id,
                     root_url,
                     allowed_domains,
+                    site_aliases or [],
                     json.dumps(_json_safe(crawl_policy or {}), ensure_ascii=False),
                 ),
             )
 
     async def site_status(self, site_id: str | None = None) -> dict:
-        with psycopg.connect(self.database_url, row_factory=dict_row) as conn:
-            site_rows = conn.execute(
+        async with await psycopg.AsyncConnection.connect(self.database_url, row_factory=dict_row) as conn:
+            site_cursor = await conn.execute(
                 """
-                SELECT site_id, root_url, allowed_domains, crawl_policy, created_at::text, updated_at::text
+                SELECT site_id, root_url, allowed_domains, site_aliases, crawl_policy,
+                       created_at::text, updated_at::text
                 FROM sites
                 WHERE (%s::text IS NULL OR site_id = %s)
                 ORDER BY updated_at DESC
                 """,
                 (site_id, site_id),
-            ).fetchall()
-            category_rows = conn.execute(
+            )
+            site_rows = await site_cursor.fetchall()
+            category_cursor = await conn.execute(
                 """
                 SELECT category, count(*) AS count
                 FROM documents
@@ -457,16 +500,18 @@ class PostgresKnowledgeBase:
                 ORDER BY count DESC, category ASC
                 """,
                 (site_id, site_id),
-            ).fetchall()
-            doc_count = conn.execute(
+            )
+            category_rows = await category_cursor.fetchall()
+            doc_cursor = await conn.execute(
                 """
                 SELECT count(*) AS count, max(crawled_at)::text AS latest_crawl
                 FROM documents
                 WHERE (%s::text IS NULL OR site_id = %s)
                 """,
                 (site_id, site_id),
-            ).fetchone()
-            stale_count = conn.execute(
+            )
+            doc_count = await doc_cursor.fetchone()
+            stale_cursor = await conn.execute(
                 """
                 SELECT count(*) AS count
                 FROM documents
@@ -475,7 +520,8 @@ class PostgresKnowledgeBase:
                   AND valid_until < now()
                 """,
                 (site_id, site_id),
-            ).fetchone()
+            )
+            stale_count = await stale_cursor.fetchone()
         return {
             "site_id": site_id,
             "sites": [dict(row) for row in site_rows],
@@ -485,35 +531,57 @@ class PostgresKnowledgeBase:
             "stale_count": int(stale_count["count"] or 0),
         }
 
-    def _backfill_search_text(self, conn) -> None:
-        with conn.cursor(row_factory=dict_row) as cur:
-            rows = cur.execute(
+    async def _backfill_search_text(self, conn) -> None:
+        async with conn.cursor(row_factory=dict_row) as cur:
+            await cur.execute(
                 """
                 SELECT id::text, title, section, category, content, source_url, language, metadata
                 FROM documents
                 WHERE search_text = ''
                 """
-            ).fetchall()
+            )
+            rows = await cur.fetchall()
         for row in rows:
-            conn.execute(
+            await conn.execute(
                 "UPDATE documents SET search_text = %s WHERE id = %s::uuid",
                 (_search_text(dict(row)), row["id"]),
             )
 
-    def _upsert_site_for_chunk(self, conn, site_id: str, source_url: str) -> None:
+    async def _upsert_site_for_chunk(self, conn, site_id: str, source_url: str) -> None:
         root_url = canonical_root_url(source_url)
-        conn.execute(
+        await conn.execute(
             """
-            INSERT INTO sites (site_id, root_url, allowed_domains, crawl_policy)
-            VALUES (%s, %s, %s, '{}'::jsonb)
+            INSERT INTO sites (site_id, root_url, allowed_domains, site_aliases, crawl_policy)
+            VALUES (%s, %s, %s, ARRAY[]::text[], '{}'::jsonb)
             ON CONFLICT (site_id) DO NOTHING
             """,
             (site_id, root_url, [urlparse_root_host(source_url)]),
         )
 
+    async def _ensure_vector_index(self, conn) -> None:
+        cursor = await conn.execute("SELECT count(*) AS count FROM documents")
+        row = await cursor.fetchone()
+        document_count = int(row["count"] if isinstance(row, dict) else row[0])
+        if document_count <= 0:
+            return
+        lists = _ivfflat_lists(document_count)
+        await conn.execute(
+            f"""
+            CREATE INDEX IF NOT EXISTS documents_embedding_idx
+            ON documents USING ivfflat (embedding vector_cosine_ops)
+            WITH (lists = {lists})
+            """
+        )
+
 
 def _cosine(left: list[float], right: list[float]) -> float:
     return sum(a * b for a, b in zip(left, right, strict=True))
+
+
+def _ivfflat_lists(document_count: int) -> int:
+    if document_count < 1_000:
+        return 1
+    return max(1, min(100, document_count // 1_000))
 
 
 def _knowledge_hit_from_row(row: dict) -> KnowledgeHit:
@@ -540,24 +608,25 @@ def _rrf_fuse(
     limit: int,
     k: int = 60,
 ) -> list[tuple[float, dict]]:
-    fused: dict[str, tuple[float, dict, float]] = {}
+    fused: dict[str, tuple[float, dict, float | None]] = {}
     for ranked in (vector_ranked, lexical_ranked):
         ordered = sorted(ranked, key=lambda item: item[0], reverse=True)
         for rank, (_, row, confidence) in enumerate(ordered, start=1):
             row_id = _row_key(row)
-            current_score, current_row, current_confidence = fused.get(row_id, (0.0, dict(row), 0.0))
+            current_score, current_row, current_confidence = fused.get(row_id, (0.0, dict(row), None))
             fused[row_id] = (
                 current_score + 1.0 / (k + rank),
                 current_row,
-                max(current_confidence, confidence),
+                confidence if current_confidence is None else max(current_confidence, confidence),
             )
 
     results = []
     for fusion_score, row, confidence in fused.values():
+        confidence = float(confidence or 0.0)
         row["score"] = confidence
         row["fusion_score"] = fusion_score
-        results.append((fusion_score, row))
-    results.sort(key=lambda item: item[0], reverse=True)
+        results.append((confidence, row))
+    results.sort(key=lambda item: (item[0], float(item[1].get("fusion_score") or 0.0)), reverse=True)
     return results[:limit]
 
 
@@ -607,16 +676,7 @@ def _keyword_score(query: str, row: dict) -> float:
     ).lower()
     query_lower = query.lower()
     score = 0.0
-    category_boosts = {
-        "affiliate": ("affiliate", "hoa hồng", "đối tác"),
-        "vinclub": ("vinclub", "hội viên", "gold", "platinum", "diamond"),
-        "offer": ("ưu đãi", "voucher", "khuyến mãi", "giảm", "hạn áp dụng"),
-        "price": ("giá", "giá vé", "bảng giá", "vnđ", "vnd"),
-        "booking": ("booking", "đặt vé", "đặt online", "qr"),
-        "schedule": ("giờ", "mở cửa", "lịch", "lúc nào", "thời gian"),
-        "experience": ("show", "biểu diễn", "động vật", "animal", "night safari", "kid zoo"),
-    }
-    for category, keywords in category_boosts.items():
+    for category, keywords in CATEGORY_KEYWORDS.items():
         if any(keyword in query_lower for keyword in keywords):
             if row.get("category") == category:
                 score += 0.45
@@ -629,68 +689,59 @@ def _keyword_score(query: str, row: dict) -> float:
 
 
 def _adjusted_score(query: str, row: dict, base_score: float) -> float:
-    return base_score + _keyword_score(query, row) + _safari_relevance_score(query, row)
+    return base_score + _keyword_score(query, row) + _site_relevance_score(query, row)
 
 
-def _safari_relevance_score(query: str, row: dict) -> float:
+def _confidence_with_lexical_score(confidence: float, lexical_score: float) -> float:
+    lexical_boost = min(max(lexical_score, 0.0) * 0.08, 0.30)
+    return confidence + lexical_boost
+
+
+def _site_relevance_score(query: str, row: dict) -> float:
     query_lower = query.lower()
     haystack = " ".join(
         str(row.get(key, "")) for key in ("title", "section", "category", "content", "source_url")
     ).lower()
     source_url = str(row.get("source_url", "")).lower()
-    score = 0.0
+    profile = relevance_profile_for_text(str(row.get("site_id") or ""), f"{haystack} {source_url}")
+    configured_aliases = tuple(str(alias).lower() for alias in (row.get("site_aliases") or ()))
+    profile_aliases = profile.aliases if profile else ()
+    aliases = configured_aliases + tuple(
+        alias for alias in profile_aliases if alias not in configured_aliases
+    )
+    if not aliases:
+        return 0.0
 
-    safari_domain_query = not _mentions_other_destination(query_lower)
-    if safari_domain_query:
-        safari_markers = (
-            "vinpearl safari phú quốc",
-            "vinpearl safari phu quoc",
-            "vinpearl-safari-phu-quoc",
-        )
-        if any(marker in haystack for marker in safari_markers):
+    score = 0.0
+    off_topic_aliases = profile.off_topic_aliases if profile else ()
+    url_markers = profile.url_markers if profile else ()
+
+    site_domain_query = not _mentions_off_topic_alias(query_lower, off_topic_aliases)
+    if site_domain_query:
+        if any(marker in haystack for marker in aliases):
             score += 0.85
-        if "/vinpearl-safari-phu-quoc/" in source_url:
+        if any(marker in source_url for marker in url_markers):
             score += 0.45
         if row.get("language") == "vi" and _looks_vietnamese(query_lower):
             score += 0.12
-        if "/vi/uu-dai/" in source_url and not any(marker in haystack for marker in safari_markers):
+        if (
+            profile
+            and profile.offer_path_penalty
+            and profile.offer_path_penalty in source_url
+            and not any(marker in haystack for marker in aliases)
+        ):
             score -= 0.35
 
-        off_topic_markers = (
-            "nha trang",
-            "vũ yên",
-            "vu yen",
-            "hà nội",
-            "ha noi",
-            "ocean city",
-            "horse academy",
-            "đất nước thiên hùng ca",
-            "grand world",
-            "vinwonders phú quốc",
-            "vinwonders phu quoc",
-        )
-        for marker in off_topic_markers:
-            if marker in haystack and not any(safari in haystack for safari in safari_markers):
+        for marker in off_topic_aliases:
+            if marker in haystack and not any(alias in haystack for alias in aliases):
                 score -= 0.7
                 break
 
     return score
 
 
-def _mentions_other_destination(query_lower: str) -> bool:
-    return any(
-        marker in query_lower
-        for marker in (
-            "nha trang",
-            "vũ yên",
-            "vu yen",
-            "hà nội",
-            "ha noi",
-            "grand world",
-            "vinwonders phú quốc",
-            "vinwonders phu quoc",
-        )
-    )
+def _mentions_off_topic_alias(query_lower: str, aliases: tuple[str, ...]) -> bool:
+    return any(marker in query_lower for marker in aliases)
 
 
 def _looks_vietnamese(value: str) -> bool:
@@ -727,14 +778,7 @@ def _diversify_categories(query: str, scored: list[tuple[float, dict]], limit: i
 def _wanted_categories(query: str) -> list[str]:
     query_lower = query.lower()
     wanted = []
-    checks = [
-        ("affiliate", ("affiliate", "hoa hồng", "đối tác")),
-        ("vinclub", ("vinclub", "hội viên", "gold", "platinum", "diamond")),
-        ("offer", ("ưu đãi", "voucher", "khuyến mãi", "giảm")),
-        ("price", ("giá", "giá vé", "bảng giá")),
-        ("booking", ("booking", "đặt vé", "đặt online")),
-    ]
-    for category, keywords in checks:
+    for category, keywords in CATEGORY_KEYWORDS.items():
         if any(keyword in query_lower for keyword in keywords):
             wanted.append(category)
     return wanted

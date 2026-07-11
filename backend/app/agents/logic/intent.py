@@ -109,7 +109,9 @@ def supervisor_messages(transcript: str):
                 "entities là các cụm thực thể quan trọng; confidence từ 0 đến 1; "
                 "suggested_route là safari_knowledge, direct_response hoặc direct_handoff. "
                 "Chọn direct_response cho chào hỏi/ngoài phạm vi. Chọn direct_handoff khi câu hỏi "
-                "giá vé/ưu đãi/booking cần xác nhận ngay."
+                "không thể xử lý bằng knowledge base. Với giá vé/ưu đãi/booking, chọn "
+                "safari_knowledge để tìm dữ liệu trước; hệ thống sẽ tự handoff nếu dữ liệu thiếu "
+                "hoặc hết hạn."
             )
         ),
         HumanMessage(content=transcript),
@@ -118,9 +120,9 @@ def supervisor_messages(transcript: str):
 
 def coerce_supervisor_decision(value: Any) -> SupervisorDecision:
     if isinstance(value, SupervisorDecision):
-        return value
+        return _normalize_supervisor_decision(value)
     if isinstance(value, dict):
-        return SupervisorDecision.model_validate(value)
+        return _normalize_supervisor_decision(SupervisorDecision.model_validate(value))
     return parse_supervisor_payload(str(value))
 
 
@@ -140,7 +142,13 @@ def parse_supervisor_payload(content: str) -> SupervisorDecision:
             if intent in {"small_talk", "out_of_scope"}
             else "safari_knowledge",
         }
-    return SupervisorDecision.model_validate(payload)
+    return _normalize_supervisor_decision(SupervisorDecision.model_validate(payload))
+
+
+def _normalize_supervisor_decision(value: SupervisorDecision) -> SupervisorDecision:
+    if value.is_time_sensitive and value.suggested_route == "direct_handoff":
+        return value.model_copy(update={"suggested_route": "safari_knowledge"})
+    return value
 
 
 def route_from_decision(decision_value: SupervisorDecision) -> str:
