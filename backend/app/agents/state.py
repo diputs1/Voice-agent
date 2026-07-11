@@ -47,4 +47,5 @@ class AgentState(RetrievalState, CrawlState, VoiceState, total=False):
     tool_call_count: int
 
 
+AgentUpdate = dict[str, Any]
 SafariState = AgentState

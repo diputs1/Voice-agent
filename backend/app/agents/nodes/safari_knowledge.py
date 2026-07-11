@@ -4,11 +4,12 @@ from langsmith import traceable
 
 from app.agents.logic.answer_grounding import citation, hit_payload
 from app.agents.schemas import SafariState
+from app.agents.state import AgentUpdate
 from app.knowledge.kb import Retriever
 
 
 @traceable(name="graph.safari_knowledge")
-async def safari_knowledge_node(state: SafariState, kb: Retriever) -> SafariState:
+async def safari_knowledge_node(state: SafariState, kb: Retriever) -> AgentUpdate:
     query = state.get("search_query") or state.get("transcript", "")
     try:
         hits = await kb.search(query, limit=5, site_id=state.get("site_id"))

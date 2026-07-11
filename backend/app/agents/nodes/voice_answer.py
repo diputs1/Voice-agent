@@ -14,11 +14,12 @@ from app.agents.logic.answer_grounding import (
     word_chunks,
 )
 from app.agents.schemas import SafariState
+from app.agents.state import AgentUpdate
 from app.prompts import load_prompt
 
 
 @traceable(name="graph.voice_answer")
-async def voice_answer_node(state: SafariState, llm) -> SafariState:
+async def voice_answer_node(state: SafariState, llm) -> AgentUpdate:
     if state.get("answer") and state.get("handoff_required"):
         return state
 
@@ -55,7 +56,7 @@ async def stream_voice_answer_tokens(state: SafariState, llm) -> AsyncIterator[s
         yield token
 
 
-def finalize_streamed_answer(state: SafariState, answer: str) -> SafariState:
+def finalize_streamed_answer(state: SafariState, answer: str) -> AgentUpdate:
     if state.get("answer") and state.get("handoff_required"):
         return state
     if not is_grounded_quantitative_answer(answer, state.get("retrieved_context", [])):

@@ -4,10 +4,11 @@ from langsmith import traceable
 
 from app.agents.logic.answer_grounding import handoff_state
 from app.agents.schemas import SafariState
+from app.agents.state import AgentUpdate
 
 
 @traceable(name="graph.direct_response")
-async def direct_response_node(state: SafariState) -> SafariState:
+async def direct_response_node(state: SafariState) -> AgentUpdate:
     intent = state.get("intent")
     if intent == "small_talk":
         answer = (
@@ -31,7 +32,7 @@ async def direct_response_node(state: SafariState) -> SafariState:
 
 
 @traceable(name="graph.direct_handoff")
-async def direct_handoff_node(state: SafariState) -> SafariState:
+async def direct_handoff_node(state: SafariState) -> AgentUpdate:
     return {
         **handoff_state(state, "stale_or_missing_time_sensitive_data"),
         "route": "direct_handoff",

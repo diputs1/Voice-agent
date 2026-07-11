@@ -1,12 +1,12 @@
 from __future__ import annotations
 
 from collections.abc import AsyncIterator
-from typing import Literal
+from typing import Any, Callable, Literal
 
 from langchain_openai import ChatOpenAI
-from langgraph.checkpoint.memory import MemorySaver
 from langgraph.graph import END, START, StateGraph
 
+from app.agents.checkpointers import build_memory_checkpointer
 from app.agents.edges.route_rules import route_after_supervisor
 from app.agents.nodes.contextualize import contextualize_query_node
 from app.agents.nodes.direct_response import direct_handoff_node, direct_response_node
@@ -21,7 +21,7 @@ from app.agents.nodes.voice_answer import (
     voice_answer_node,
 )
 from app.agents.schemas import SupervisorDecision
-from app.agents.state import AgentState
+from app.agents.state import AgentState, AgentUpdate
 from app.core.config import Settings
 from app.knowledge.kb import AgentKnowledgeBase
 
@@ -35,10 +35,12 @@ class WebsiteAgentGraph:
         settings: Settings,
         *,
         legacy_node_names: bool = False,
+        checkpointer_factory: Callable[[], Any] = build_memory_checkpointer,
     ) -> None:
         self.kb = kb
         self.settings = settings
         self.legacy_node_names = legacy_node_names
+        self.checkpointer_factory = checkpointer_factory
         self.llm = (
             ChatOpenAI(
                 model=settings.openai_chat_model,
@@ -68,7 +70,7 @@ class WebsiteAgentGraph:
 
     async def astream_pre_answer(
         self, state: AgentState, thread_id: str
-    ) -> AsyncIterator[tuple[str, AgentState, AgentState]]:
+    ) -> AsyncIterator[tuple[str, AgentUpdate, AgentState]]:
         state = await self._with_thread_history(state, thread_id)
         current: AgentState = dict(state)
         update = await self._supervisor_node(current)
@@ -155,15 +157,15 @@ class WebsiteAgentGraph:
         graph.add_edge("escalation", "voice_answer")
         graph.add_edge("voice_answer", END)
 
-        return graph.compile(checkpointer=MemorySaver())
+        return graph.compile(checkpointer=self.checkpointer_factory())
 
-    async def _supervisor_node(self, state: AgentState) -> AgentState:
+    async def _supervisor_node(self, state: AgentState) -> AgentUpdate:
         return await supervisor_node(state, self.llm)
 
-    async def _contextualize_query_node(self, state: AgentState) -> AgentState:
+    async def _contextualize_query_node(self, state: AgentState) -> AgentUpdate:
         return await contextualize_query_node(state, self.llm)
 
-    async def _knowledge_node(self, state: AgentState) -> AgentState:
+    async def _knowledge_node(self, state: AgentState) -> AgentUpdate:
         update = await safari_knowledge_node(state, self.kb)
         update["retrieval_debug"] = {
             "site_id": state.get("site_id"),
@@ -172,22 +174,22 @@ class WebsiteAgentGraph:
         }
         return update
 
-    async def _offer_freshness_node(self, state: AgentState) -> AgentState:
+    async def _offer_freshness_node(self, state: AgentState) -> AgentUpdate:
         return await offer_freshness_node(state, self.settings.low_confidence_threshold)
 
-    async def _retry_query_node(self, state: AgentState) -> AgentState:
+    async def _retry_query_node(self, state: AgentState) -> AgentUpdate:
         return await retry_query_node(state)
 
-    async def _escalation_node(self, state: AgentState) -> AgentState:
+    async def _escalation_node(self, state: AgentState) -> AgentUpdate:
         return await escalation_node(state)
 
-    async def _voice_answer_node(self, state: AgentState) -> AgentState:
+    async def _voice_answer_node(self, state: AgentState) -> AgentUpdate:
         return await voice_answer_node(state, self.llm)
 
-    async def _direct_response_node(self, state: AgentState) -> AgentState:
+    async def _direct_response_node(self, state: AgentState) -> AgentUpdate:
         return await direct_response_node(state)
 
-    async def _direct_handoff_node(self, state: AgentState) -> AgentState:
+    async def _direct_handoff_node(self, state: AgentState) -> AgentUpdate:
         return await direct_handoff_node(state)
 
     def _route_after_freshness(self, state: AgentState) -> Literal["retry", "escalate", "answer"]:
