@@ -1,5 +1,5 @@
-"""Compatibility exports for agent prompt loading."""
+"""Agent-facing prompt loader exports."""
 
-from app.prompts import Prompt, load_prompt
+from app.agents.prompts.loader import Prompt, load_prompt
 
 __all__ = ["Prompt", "load_prompt"]

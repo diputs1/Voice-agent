@@ -15,7 +15,7 @@ from app.agents.logic.answer_grounding import (
 )
 from app.agents.schemas import SafariState
 from app.agents.state import AgentUpdate
-from app.prompts import load_prompt
+from app.agents.prompts import load_prompt
 
 
 @traceable(name="graph.voice_answer")

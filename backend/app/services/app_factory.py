@@ -5,6 +5,7 @@ import logging
 
 from fastapi import FastAPI
 
+from app.agents.config import AgentConfig
 from app.agents.graphs import WebsiteAgentGraph
 from app.core.cache import TTLQACache
 from app.core.config import Settings
@@ -25,7 +26,12 @@ async def initialize_app_state(app: FastAPI, settings: Settings) -> None:
     app.state.kb_status = {"provider": "unknown", "fallback": False, "fallback_reason": None}
     app.state.kb = await build_knowledge_base(app, settings)
     app.state.crawl_job_store = await build_crawl_job_store(app, settings)
-    app.state.agent_graph = WebsiteAgentGraph(app.state.kb, settings)
+    app.state.agent_config = AgentConfig.from_settings(settings)
+    app.state.agent_graph = WebsiteAgentGraph(
+        app.state.kb,
+        settings,
+        agent_config=app.state.agent_config,
+    )
     app.state.agent_semaphore = asyncio.Semaphore(settings.agent_max_concurrency)
     app.state.qa_cache = TTLQACache(
         ttl_seconds=settings.qa_cache_ttl_seconds,

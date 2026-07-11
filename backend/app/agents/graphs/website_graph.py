@@ -7,6 +7,7 @@ from langchain_openai import ChatOpenAI
 from langgraph.graph import END, START, StateGraph
 
 from app.agents.checkpointers import build_memory_checkpointer
+from app.agents.config import AgentConfig
 from app.agents.edges.route_rules import route_after_supervisor
 from app.agents.nodes.contextualize import contextualize_query_node
 from app.agents.nodes.direct_response import direct_handoff_node, direct_response_node
@@ -36,9 +37,11 @@ class WebsiteAgentGraph:
         *,
         legacy_node_names: bool = False,
         checkpointer_factory: Callable[[], Any] = build_memory_checkpointer,
+        agent_config: AgentConfig | None = None,
     ) -> None:
         self.kb = kb
         self.settings = settings
+        self.agent_config = agent_config or AgentConfig.from_settings(settings)
         self.legacy_node_names = legacy_node_names
         self.checkpointer_factory = checkpointer_factory
         self.llm = (
@@ -175,7 +178,7 @@ class WebsiteAgentGraph:
         return update
 
     async def _offer_freshness_node(self, state: AgentState) -> AgentUpdate:
-        return await offer_freshness_node(state, self.settings.low_confidence_threshold)
+        return await offer_freshness_node(state, self.agent_config.low_confidence_threshold)
 
     async def _retry_query_node(self, state: AgentState) -> AgentUpdate:
         return await retry_query_node(state)
@@ -193,7 +196,7 @@ class WebsiteAgentGraph:
         return await direct_handoff_node(state)
 
     def _route_after_freshness(self, state: AgentState) -> Literal["retry", "escalate", "answer"]:
-        return route_after_freshness(state, self.settings.low_confidence_threshold)
+        return route_after_freshness(state, self.agent_config.low_confidence_threshold)
 
     def _route_after_supervisor(self, state: AgentState) -> Literal["direct", "handoff", "knowledge"]:
         return route_after_supervisor(state)
