@@ -7,7 +7,6 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
-import httpx
 from bs4 import BeautifulSoup
 
 SOURCE_URL = "https://vinwonders.com/vi/vinpearl-safari-phu-quoc/"
@@ -68,62 +67,6 @@ STABLE_SEED_FACTS = [
 ]
 
 
-async def fetch_vinwonders_chunks(url: str = SOURCE_URL) -> list[IngestedChunk]:
-    async with httpx.AsyncClient(timeout=20.0, follow_redirects=True) as client:
-        response = await client.get(url)
-        response.raise_for_status()
-
-    soup = BeautifulSoup(response.text, "html.parser")
-    for tag in soup(["script", "style", "noscript", "svg"]):
-        tag.decompose()
-
-    title = _clean(soup.title.get_text(" ")) if soup.title else "Vinpearl Safari Phú Quốc"
-    blocks: list[tuple[str, str]] = []
-    current_section = "Trang VinWonders"
-    for element in soup.find_all(["h1", "h2", "h3", "p", "li"]):
-        text = _clean(element.get_text(" "))
-        if len(text) < 20:
-            continue
-        if element.name in {"h1", "h2", "h3"}:
-            current_section = text[:140]
-            continue
-        blocks.append((current_section, text))
-
-    if not blocks:
-        return seed_chunks(url)
-
-    grouped: dict[str, list[str]] = {}
-    for section, text in blocks:
-        grouped.setdefault(section, []).append(text)
-
-    chunks: list[IngestedChunk] = []
-    crawled_at = datetime.now(UTC)
-    for section, texts in grouped.items():
-        for content in _chunk_text(" ".join(texts)):
-            category = classify_category(content)
-            chunks.append(
-                IngestedChunk(
-                    title=title[:200],
-                    section=section[:200],
-                    category=category,
-                    content=content,
-                    source_url=url,
-                    content_hash=_hash(content),
-                    crawled_at=crawled_at,
-                    valid_until=_valid_until(category, crawled_at),
-                    metadata={
-                        "seed_url": url,
-                        "canonical_url": url,
-                        "source_type": "vinwonders_page",
-                        "render_mode": "http",
-                        "crawl_depth": 0,
-                        "confidence": 0.7,
-                    },
-                )
-            )
-    return chunks or seed_chunks(url)
-
-
 def seed_chunks(url: str = SOURCE_URL) -> list[IngestedChunk]:
     crawled_at = datetime.now(UTC)
     return [
@@ -151,6 +94,17 @@ def seed_chunks(url: str = SOURCE_URL) -> list[IngestedChunk]:
 
 def classify_category(text: str) -> str:
     lowered = text.lower()
+    if any(
+        keyword in lowered
+        for keyword in [
+            "nơi mở ra những vùng đất diệu kỳ",
+            "wonderculture",
+            "wonderland",
+            "wondermoment",
+            "wondercreature",
+        ]
+    ):
+        return "wonderpedia"
     if any(
         keyword in lowered
         for keyword in [

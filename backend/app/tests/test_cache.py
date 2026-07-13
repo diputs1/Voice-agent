@@ -34,6 +34,20 @@ async def test_qa_cache_honors_ttl():
     assert await cache.get(key) is None
 
 
+@pytest.mark.asyncio
+async def test_qa_cache_overwrite_ignores_stale_heap_expiration():
+    cache = TTLQACache(ttl_seconds=60, max_entries=8)
+    key = QACacheKey(query="a", doc_set_hash="docs")
+    other = QACacheKey(query="b", doc_set_hash="docs")
+
+    await cache.set(key, {"answer": "old"})
+    await cache.set(key, {"answer": "new"})
+    cache._expirations[0] = (time_expired(), 0, key)
+    await cache.set(other, {"answer": "other"})
+
+    assert await cache.get(key) == {"answer": "new"}
+
+
 def test_normalize_cache_query_is_case_and_whitespace_insensitive():
     assert normalize_cache_query("  Giá   Vé  ") == "giá vé"
 
@@ -61,3 +75,9 @@ async def test_in_memory_doc_set_hash_changes_when_documents_change():
     )
 
     assert await kb.doc_set_hash() != before
+
+
+def time_expired() -> float:
+    import time
+
+    return time.monotonic() - 1.0

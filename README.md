@@ -57,7 +57,7 @@ Vin_agent/
 │   │   ├── 📂 crawling/                 # 🕸️ WEBSITE CRAWLING & CHUNKING
 │   │   │   ├── __init__.py
 │   │   │   ├── firecrawl.py             # Firecrawl client + Markdown chunking
-│   │   │   ├── ingestion.py             # HTML fallback ingestion + chunk models
+│   │   │   ├── ingestion.py             # Chunk models + HTML extraction helpers
 │   │   │   ├── jobs.py                  # Crawl job persistence
 │   │   │   └── link_discovery.py        # URL discovery/filtering rules
 │   │   │
@@ -168,7 +168,7 @@ Open http://localhost:3000.
 
 If `OPENAI_API_KEY` or Postgres is missing, the backend falls back to deterministic local embeddings and an in-memory seed KB so tests and UI development still work.
 
-For full web ingestion, set `FIRECRAWL_API_KEY` in `backend/.env`. Without it, `/admin/ingest-vinwonders` uses a one-page fallback and `/admin/crawl` returns `501`.
+For web ingestion, set `FIRECRAWL_API_KEY` in `backend/.env`. Without it, both `/admin/ingest-vinwonders` and `/admin/crawl` return `501`.
 
 For production-like environments, set `ADMIN_API_KEY`; admin endpoints fail closed outside local/dev if it is missing.
 Optional LangSmith tracing uses the standard LangChain env vars:

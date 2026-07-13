@@ -2,7 +2,15 @@ import pytest
 
 from app.knowledge.embeddings import EmbeddingProvider
 from app.crawling.ingestion import IngestedChunk
-from app.knowledge.kb import InMemoryKnowledgeBase, _adjusted_score, _diversify_categories, _normalize_text, _rrf_fuse
+from app.knowledge.kb import (
+    InMemoryKnowledgeBase,
+    PostgresKnowledgeBase,
+    _adjusted_score,
+    _diversify_categories,
+    _normalize_text,
+    _rrf_fuse,
+    _wanted_categories,
+)
 
 from datetime import UTC, datetime
 
@@ -79,6 +87,20 @@ def test_diversify_categories_does_not_duplicate_extra_picks():
     assert ids == ["price-1", "offer-1", "price-2"]
 
 
+def test_product_query_prioritizes_booking_and_experience_categories():
+    rows = [
+        (0.95, {"id": "overview-1", "category": "overview"}),
+        (0.40, {"id": "booking-1", "category": "booking"}),
+        (0.35, {"id": "experience-1", "category": "experience"}),
+    ]
+
+    picked = _diversify_categories("Các sản phẩm của VinSafari Phú Quốc", rows, 3)
+    ids = [row["id"] for _, row in picked[:3]]
+
+    assert _wanted_categories("Các sản phẩm của VinSafari Phú Quốc") == ["booking", "experience"]
+    assert ids == ["booking-1", "experience-1", "overview-1"]
+
+
 def test_normalize_text_strips_vietnamese_diacritics():
     assert _normalize_text("Cầu Hôn Phú Quốc") == "cau hon phu quoc"
 
@@ -144,3 +166,70 @@ async def test_in_memory_hybrid_search_matches_unaccented_exact_keyword():
     hits = await kb.search("cau hon", limit=2)
 
     assert hits[0].id == "cau-hon"
+
+
+@pytest.mark.asyncio
+async def test_postgres_ensure_ready_creates_thread_lookup_index():
+    pool = FakePool()
+    kb = PostgresKnowledgeBase(
+        "postgresql://example",
+        EmbeddingProvider(None, "text-embedding-3-small"),
+        pool=pool,
+    )
+
+    await kb.ensure_ready()
+
+    assert any("thread_turns_thread_created_idx" in statement for statement in pool.statements)
+
+
+class FakePool:
+    def __init__(self) -> None:
+        self.connection_obj = FakeConnection()
+        self.statements = self.connection_obj.statements
+
+    def connection(self):
+        return FakeConnectionContext(self.connection_obj)
+
+
+class FakeConnectionContext:
+    def __init__(self, conn):
+        self.conn = conn
+
+    async def __aenter__(self):
+        return self.conn
+
+    async def __aexit__(self, exc_type, exc, traceback):
+        return None
+
+
+class FakeConnection:
+    def __init__(self) -> None:
+        self.statements = []
+
+    async def execute(self, statement, params=None):
+        del params
+        self.statements.append(str(statement))
+        return FakeCursor()
+
+    def cursor(self, row_factory=None):
+        del row_factory
+        return FakeCursorContext()
+
+
+class FakeCursorContext:
+    async def __aenter__(self):
+        return FakeCursor()
+
+    async def __aexit__(self, exc_type, exc, traceback):
+        return None
+
+
+class FakeCursor:
+    async def execute(self, statement, params=None):
+        del statement, params
+
+    async def fetchall(self):
+        return []
+
+    async def fetchone(self):
+        return {"count": 0}

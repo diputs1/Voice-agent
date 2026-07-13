@@ -17,7 +17,6 @@ TIME_SENSITIVE_KEYWORDS = {
     "voucher",
     "combo",
     "vinclub",
-    "affiliate",
     "hôm nay",
     "ngày mai",
     "bao nhiêu tiền",
@@ -189,6 +188,14 @@ def entities_from_rules(lowered: str) -> list[str]:
         "vinclub",
         "voucher",
         "khuyến mãi",
+        "affiliate",
+        "sản phẩm",
+        "san pham",
+        "product",
+        "products",
+        "tour",
+        "gói",
+        "dịch vụ",
     )
     return matched_keywords(lowered, keywords)
 

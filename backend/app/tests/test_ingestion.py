@@ -13,6 +13,7 @@ def test_seed_chunks_have_required_metadata():
 
 
 def test_classifies_time_sensitive_content():
+    assert classify_category("WONDERPEDIA Nơi mở ra những vùng đất diệu kỳ WonderCulture WonderLand") == "wonderpedia"
     assert classify_category("Giá vé và ưu đãi mới nhất") == "price"
     assert classify_category("Hạn áp dụng voucher giảm 15%") == "offer"
     assert classify_category("Giờ mở cửa hằng ngày 09:00") == "schedule"

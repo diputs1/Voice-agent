@@ -68,20 +68,21 @@ a {
 }
 
 .shell {
-  max-width: 1120px;
+  max-width: 920px;
   width: 100%;
   margin: 0 auto;
   padding: 24px 20px;
-  display: grid;
-  grid-template-columns: minmax(0, 1fr) 320px;
-  gap: 20px;
+  display: block;
 }
 
-.conversation,
-.side {
+.conversation {
   background: var(--panel);
   border: 1px solid var(--line);
   border-radius: 8px;
+}
+
+.voice-shell {
+  min-width: 0;
 }
 
 .conversation {
@@ -112,6 +113,10 @@ a {
 
 .message.assistant {
   background: #f1f3f5;
+}
+
+.message.live-message {
+  color: var(--muted);
 }
 
 .message p {
@@ -192,98 +197,7 @@ textarea {
   overflow-wrap: anywhere;
 }
 
-.side {
-  padding: 18px;
-  display: flex;
-  flex-direction: column;
-  gap: 18px;
-  align-self: start;
-  min-width: 0;
-}
-
-.side h2 {
-  margin: 0;
-  font-size: 16px;
-}
-
-.source-list {
-  display: grid;
-  gap: 10px;
-  min-width: 0;
-}
-
-.handoff {
-  border: 1px solid #e0c36b;
-  border-radius: 8px;
-  background: #fff8df;
-  padding: 12px;
-  display: grid;
-  gap: 8px;
-  font-size: 13px;
-  line-height: 1.4;
-}
-
-.handoff strong {
-  font-size: 14px;
-}
-
-.handoff span {
-  color: var(--muted);
-}
-
-.handoff a {
-  color: var(--brand);
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
-  font-weight: 700;
-  text-decoration: none;
-}
-
-.source {
-  border: 1px solid var(--line);
-  border-radius: 8px;
-  padding: 10px;
-  font-size: 13px;
-  line-height: 1.4;
-  min-width: 0;
-  overflow: hidden;
-  overflow-wrap: anywhere;
-}
-
-.source strong {
-  display: block;
-  margin-bottom: 8px;
-}
-
-.source-meta {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 6px;
-  margin-bottom: 8px;
-}
-
-.source-meta span {
-  border: 1px solid var(--line);
-  border-radius: 999px;
-  color: var(--muted);
-  font-size: 11px;
-  line-height: 1;
-  padding: 4px 7px;
-  text-transform: uppercase;
-}
-
-.source a {
-  color: var(--brand);
-  word-break: break-word;
-  overflow-wrap: anywhere;
-}
-
 @media (max-width: 860px) {
-  .shell {
-    grid-template-columns: 1fr;
-  }
-
   .conversation {
     min-height: 620px;
   }
