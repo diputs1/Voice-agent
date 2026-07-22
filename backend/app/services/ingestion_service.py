@@ -10,7 +10,6 @@ from fastapi import BackgroundTasks, HTTPException
 from app.core.config import Settings
 from app.crawling.jobs import CrawlJobStore
 from app.crawling.firecrawl import FirecrawlClient, firecrawl_result_to_chunks, scrape_result_to_chunks
-from app.crawling.ingestion import fetch_vinwonders_chunks
 from app.knowledge.kb import IngestionSink
 from app.crawling.link_discovery import LinkDiscoveryAgent, discovery_metadata_for
 from app.api.schemas import CrawlJobResponse, CrawlRequest, IngestRequest
@@ -34,33 +33,25 @@ class IngestionService:
         self.firecrawl_client = firecrawl_client
 
     async def ingest_vinwonders(self, payload: IngestRequest | None = None) -> dict[str, int | str]:
-        url = payload.url if payload and payload.url else self.settings.vinwonders_source_url
-        if self.firecrawl_client:
-            site_id = site_id_for_url(url)
-            chunks, summary = await self.collect_firecrawl_chunks(
-                url=url,
-                max_depth=2,
-                max_pages=40,
-                crawl_job_id=None,
-                site_id=site_id,
-                include_subdomains=False,
-                exclude_patterns=[],
-            )
-            inserted = await self.kb.upsert_chunks(chunks)
-            return {
-                "source_url": url,
-                "provider": "firecrawl",
-                "pages_crawled": summary["pages_crawled"],
-                "chunks_seen": len(chunks),
-                "chunks_inserted": inserted,
-            }
+        if not self.firecrawl_client:
+            raise HTTPException(status_code=501, detail="FIRECRAWL_API_KEY is not configured")
 
-        chunks = await fetch_vinwonders_chunks(url)
+        url = payload.url if payload and payload.url else self.settings.vinwonders_source_url
+        site_id = site_id_for_url(url)
+        chunks, summary = await self.collect_firecrawl_chunks(
+            url=url,
+            max_depth=2,
+            max_pages=40,
+            crawl_job_id=None,
+            site_id=site_id,
+            include_subdomains=False,
+            exclude_patterns=[],
+        )
         inserted = await self.kb.upsert_chunks(chunks)
         return {
             "source_url": url,
-            "provider": "fallback_http",
-            "warning": "FIRECRAWL_API_KEY is not configured; used one-page fallback ingestion",
+            "provider": "firecrawl",
+            "pages_crawled": summary["pages_crawled"],
             "chunks_seen": len(chunks),
             "chunks_inserted": inserted,
         }
@@ -179,10 +170,12 @@ class IngestionService:
         if not self.firecrawl_client:
             raise HTTPException(status_code=501, detail="FIRECRAWL_API_KEY is not configured")
 
+        discovery_budget = reserved_discovery_budget(max_pages)
+        initial_crawl_limit = max(1, max_pages - discovery_budget)
         firecrawl_job = await self.firecrawl_client.start_crawl(
             url=url,
             max_depth=max_depth,
-            limit=max_pages,
+            limit=initial_crawl_limit,
             include_paths=default_include_paths(url),
             exclude_paths=default_exclude_paths(exclude_patterns),
             allow_subdomains=include_subdomains,
@@ -200,6 +193,18 @@ class IngestionService:
             str(firecrawl_job["id"]),
             timeout_seconds=240.0,
         )
+        map_urls: list[str] = []
+        map_error: str | None = None
+        try:
+            map_result = await self.firecrawl_client.map(
+                url=url,
+                limit=map_discovery_limit(max_pages),
+                include_subdomains=include_subdomains,
+            )
+            map_urls = map_result_urls(map_result)
+        except Exception as exc:
+            map_error = str(exc)
+            logger.warning("Firecrawl map discovery failed for %s: %s", url, exc)
         if crawl_job_id:
             await self.update_crawl_job(
                 crawl_job_id,
@@ -209,6 +214,8 @@ class IngestionService:
                     "pages_seen": firecrawl_result.get("total", 0),
                     "pages_crawled": int(firecrawl_result.get("completed") or 0),
                     "credits_used": int(firecrawl_result.get("creditsUsed") or 0),
+                    "map_url_count": len(map_urls),
+                    "map_error": map_error,
                 },
             )
         discovered_urls = [
@@ -241,6 +248,7 @@ class IngestionService:
             firecrawl_result,
             self.firecrawl_client,
             max_scrapes=max(0, max_pages - initial_completed),
+            extra_urls=map_urls,
             on_progress=on_discovery_progress,
         )
         selected_urls = [item.url for item in discovery.selected_urls]
@@ -289,6 +297,8 @@ class IngestionService:
             "errors": discovery.scrape_errors,
             "discovered_urls": discovered_urls,
             "candidate_urls": discovery.candidate_urls,
+            "map_url_count": len(map_urls),
+            "map_error": map_error,
             "selected_urls": selected_urls,
             "skipped_urls": discovery.skipped_urls,
             "skip_reasons": discovery.skip_reasons,
@@ -304,8 +314,38 @@ def utc_now() -> str:
 
 
 def default_include_paths(url: str) -> list[str]:
-    del url
-    return []
+    lowered = url.lower()
+    if "vinwonders.com" not in lowered:
+        return []
+    language = "/en/" if "/en/" in lowered else "/vi/"
+    return [
+        f".*{language}vinpearl-safari-phu-quoc.*",
+        f".*{language}wonderpedia.*",
+        f".*{language}promotions.*",
+        f".*{language}uu-dai.*",
+    ]
+
+
+def reserved_discovery_budget(max_pages: int) -> int:
+    if max_pages <= 4:
+        return 0
+    return min(12, max(2, max_pages // 4))
+
+
+def map_discovery_limit(max_pages: int) -> int:
+    return min(5000, max(100, max_pages * 20))
+
+
+def map_result_urls(result: dict[str, object]) -> list[str]:
+    urls: list[str] = []
+    for item in result.get("links") or []:
+        if isinstance(item, dict):
+            url = item.get("url")
+        else:
+            url = item
+        if url:
+            urls.append(str(url))
+    return urls
 
 
 def default_exclude_paths(extra_patterns: list[str] | None = None) -> list[str]:

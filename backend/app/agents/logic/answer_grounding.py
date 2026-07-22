@@ -168,6 +168,28 @@ def fallback_answer(transcript: str, context: list[dict[str, Any]]) -> str:
             "Bạn có thể hỏi lại cụ thể hơn hoặc kiểm tra website VinWonders chính thức."
         )
     lowered = transcript.lower()
+    if any(keyword in lowered for keyword in ["sản phẩm", "san pham", "product", "products", "tour", "gói"]):
+        selected = []
+        seen_sections = set()
+        for item in context:
+            key = (item["category"], item["section"])
+            if item["category"] in {"experience", "service", "booking", "price"} and key not in seen_sections:
+                selected.append(item)
+                seen_sections.add(key)
+        if selected:
+            sentences = []
+            for item in selected[:4]:
+                prefix = {
+                    "experience": "Trải nghiệm",
+                    "service": "Dịch vụ",
+                    "booking": "Đặt vé",
+                    "price": "Giá vé",
+                }.get(item["category"], item["section"])
+                sentences.append(f"{prefix}: {clean_context_content(item['content'])[:260].strip()}")
+            return (
+                "Mình tìm thấy các nhóm sản phẩm/dịch vụ liên quan trong KB: "
+                + " ".join(sentences)
+            )
     if any(keyword in lowered for keyword in ["vinclub", "affiliate", "ưu đãi", "voucher", "giá vé"]):
         selected = []
         seen_sections = set()
@@ -186,7 +208,7 @@ def fallback_answer(transcript: str, context: list[dict[str, Any]]) -> str:
                     "price": "Giá vé",
                     "booking": "Đặt vé",
                 }.get(item["category"], item["section"])
-                sentences.append(f"{prefix}: {item['content'][:360].strip()}")
+                sentences.append(f"{prefix}: {clean_context_content(item['content'])[:360].strip()}")
             return (
                 "Mình tìm thấy các thông tin liên quan trong KB mới crawl. "
                 + " ".join(sentences)
@@ -197,7 +219,33 @@ def fallback_answer(transcript: str, context: list[dict[str, Any]]) -> str:
         return "Vinpearl Safari Phú Quốc thường mở cửa hằng ngày từ 09:00 đến 16:00. Bạn nên kiểm tra lại lịch vận hành trước ngày đi."
     if top["category"] == "contact":
         return "Với các thông tin cần xác nhận như đặt vé, ưu đãi hoặc lịch show, bạn nên liên hệ hotline/booking chính thức trên website VinWonders."
-    return top["content"]
+    cleaned_content = clean_context_content(top["content"])
+    if top["category"] == "wonderpedia":
+        return f"{top.get('title')}: {cleaned_content}".strip()
+    return cleaned_content
+
+
+def clean_context_content(content: Any) -> str:
+    noisy_patterns = (
+        "đăng nhập",
+        "đăng ký",
+        "trang chủ",
+        "mục lục",
+        "copy to clipboard",
+        "chia sẻ tin qua",
+    )
+    cleaned_lines: list[str] = []
+    for raw_line in str(content or "").splitlines():
+        line = raw_line.strip()
+        lowered = line.lower()
+        if not line or lowered in {"vi", "en"}:
+            continue
+        if any(pattern in lowered for pattern in noisy_patterns):
+            continue
+        if lowered in {"wonderpedia", "bài viết", "tin công ty"}:
+            continue
+        cleaned_lines.append(line)
+    return "\n".join(cleaned_lines).strip()
 
 
 def is_grounded_quantitative_answer(answer: str, context: list[dict[str, Any]]) -> bool:

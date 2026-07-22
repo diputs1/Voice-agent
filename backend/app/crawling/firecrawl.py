@@ -88,6 +88,28 @@ class FirecrawlClient:
             },
         )
 
+    async def map(
+        self,
+        *,
+        url: str,
+        search: str | None = None,
+        limit: int = 5000,
+        include_subdomains: bool = False,
+        ignore_cache: bool = False,
+    ) -> dict[str, Any]:
+        payload: dict[str, Any] = {
+            "url": url,
+            "sitemap": "include",
+            "includeSubdomains": include_subdomains,
+            "ignoreQueryParameters": True,
+            "ignoreCache": ignore_cache,
+            "limit": limit,
+            "timeout": 60000,
+        }
+        if search:
+            payload["search"] = search
+        return await self._request("POST", "/v2/map", json=payload)
+
     async def get_crawl_status(self, crawl_id_or_url: str) -> dict[str, Any]:
         if crawl_id_or_url.startswith("http"):
             return await self._request_url("GET", crawl_id_or_url)
@@ -233,7 +255,7 @@ def _url_metadata(metadata_by_url: dict[str, dict[str, Any]], *urls: str) -> dic
 
 
 def _chunk_markdown(markdown: str, size: int = 1200, overlap: int = 160) -> list[str]:
-    text = "\n".join(_clean_markdown_lines(markdown))
+    text = "\n".join(_trim_to_primary_content(_clean_markdown_lines(markdown)))
     if len(text) <= size:
         return [text] if text else []
     chunks = []
@@ -277,6 +299,28 @@ def _section_from_markdown(markdown: str, fallback_title: str = "Firecrawl conte
             if _is_good_section_label(heading):
                 return heading
     return fallback_title or "Firecrawl content"
+
+
+def _trim_to_primary_content(lines: list[str]) -> list[str]:
+    for preferred in ("# WONDERPEDIA", "# Wonderpedia"):
+        try:
+            index = lines.index(preferred)
+        except ValueError:
+            continue
+        return lines[index:]
+
+    for index, line in enumerate(lines):
+        if not re.match(r"^#\s+.+", line):
+            continue
+        heading = line.strip("# ").strip()
+        if _is_good_section_label(heading) and not _is_booking_widget_heading(heading):
+            return lines[index:]
+    return lines
+
+
+def _is_booking_widget_heading(value: str) -> bool:
+    lowered = value.lower().strip()
+    return lowered in {"đặt vé", "đặt vé vinwonders", "booking", "book tickets"}
 
 
 def _is_good_section_label(value: str) -> bool:
@@ -325,6 +369,8 @@ def _clean_markdown_lines(markdown: str) -> list[str]:
         if "production_style/style/images" in lowered:
             continue
         if _is_language_switcher_line(line):
+            continue
+        if _is_navigation_or_toc_line(line):
             continue
         if lowered in {
             "turn your device in landscape mode.",
@@ -389,3 +435,21 @@ def _is_language_switcher_line(line: str) -> bool:
             line,
         )
     )
+
+
+def _is_navigation_or_toc_line(line: str) -> bool:
+    lowered = line.lower().strip()
+    if lowered in {"vi", "en", "mục lục", "table of contents"}:
+        return True
+    noise_fragments = (
+        "booking.vinwonders.com/login",
+        "redirecturi=",
+        "[đăng nhập]",
+        "[đăng ký]",
+        "[trang chủ]",
+        "- wonderpedia",
+        "- bài viết",
+    )
+    if any(fragment in lowered for fragment in noise_fragments):
+        return True
+    return bool(re.match(r"^\s*-?\s*\[\s*\d+\s*[.)]?\s*.+#[-\wÀ-ỹ%]+", line, flags=re.IGNORECASE))

@@ -4,6 +4,7 @@ import asyncio
 import logging
 
 from fastapi import FastAPI
+from psycopg_pool import AsyncConnectionPool
 
 from app.agents.config import AgentConfig
 from app.agents.graphs import WebsiteAgentGraph
@@ -56,14 +57,30 @@ async def initialize_app_state(app: FastAPI, settings: Settings) -> None:
     )
 
 
+async def shutdown_app_state(app: FastAPI) -> None:
+    pool = getattr(app.state, "database_pool", None)
+    if pool:
+        await pool.close()
+
+
 async def build_knowledge_base(app: FastAPI, settings: Settings) -> KnowledgeBase:
     embeddings = EmbeddingProvider(settings.openai_api_key, settings.openai_embedding_model)
-    postgres = PostgresKnowledgeBase(settings.database_url, embeddings)
+    pool = AsyncConnectionPool(
+        settings.database_url,
+        min_size=settings.database_pool_min_size,
+        max_size=max(settings.database_pool_min_size, settings.database_pool_max_size),
+        kwargs={"autocommit": True},
+        open=False,
+    )
     try:
+        await pool.open()
+        postgres = PostgresKnowledgeBase(settings.database_url, embeddings, pool=pool)
         await postgres.ensure_ready()
+        app.state.database_pool = pool
         app.state.kb_status = {"provider": "postgres", "fallback": False, "fallback_reason": None}
         return postgres
     except Exception as exc:
+        await pool.close()
         if not settings.allow_kb_fallback:
             app.state.kb_status = {
                 "provider": "postgres",

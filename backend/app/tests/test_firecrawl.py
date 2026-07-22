@@ -53,6 +53,35 @@ async def test_firecrawl_client_starts_and_reads_crawl():
     assert chunks[0].metadata["source_type"] == "firecrawl"
 
 
+@pytest.mark.asyncio
+async def test_firecrawl_client_maps_urls_for_discovery():
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.headers["Authorization"] == "Bearer fc-test"
+        if request.url.path == "/v2/map" and request.method == "POST":
+            payload = request.read().decode()
+            assert '"sitemap":"include"' in payload.replace(" ", "")
+            assert '"includeSubdomains":false' in payload.replace(" ", "")
+            return httpx.Response(
+                200,
+                json={
+                    "success": True,
+                    "links": [
+                        {
+                            "url": "https://vinwonders.com/vi/wonderpedia/",
+                            "title": "Wonderpedia",
+                        }
+                    ],
+                },
+            )
+        return httpx.Response(404)
+
+    client = FirecrawlClient("fc-test", transport=httpx.MockTransport(handler))
+
+    result = await client.map(url="https://vinwonders.com/vi/vinpearl-safari-phu-quoc/", limit=100)
+
+    assert result["links"][0]["url"] == "https://vinwonders.com/vi/wonderpedia/"
+
+
 def test_scrape_result_to_chunks_handles_single_page_response():
     chunks = scrape_result_to_chunks(
         result={
@@ -114,6 +143,84 @@ def test_firecrawl_chunks_strip_image_and_related_noise():
     assert "booking-static" not in content
     assert "![" not in content
     assert "Nội dung rác" not in content
+
+
+def test_firecrawl_chunks_strip_article_navigation_and_toc():
+    chunks = firecrawl_result_to_chunks(
+        result={
+            "data": [
+                {
+                    "markdown": "\n".join(
+                        [
+                            "vi",
+                            "[Đăng nhập](https://booking.vinwonders.com/login?redirectUri=https://vinwonders.com/demo)",
+                            "[Đăng ký](https://booking.vinwonders.com/login?tab=register&redirectUri=https://vinwonders.com/demo)",
+                            "- [Trang chủ](https://vinwonders.com/)",
+                            "- Wonderpedia",
+                            "- Bài viết",
+                            "# VinWonders chính thức ra mắt VinWonders Affiliate",
+                            "VinWonders Affiliate có cơ chế hoa hồng hấp dẫn.",
+                            "Mục lục",
+                            "- [1 . Giới thiệu chương trình VinWonders Affiliate](https://vinwonders.com/demo#intro)",
+                        ]
+                    ),
+                    "metadata": {
+                        "title": "VinWonders Affiliate",
+                        "sourceURL": "https://vinwonders.com/vi/wonderpedia/news/ra-mat-chuong-trinh-vinwonders-affiliate/",
+                        "url": "https://vinwonders.com/vi/wonderpedia/news/ra-mat-chuong-trinh-vinwonders-affiliate/",
+                        "statusCode": 200,
+                    },
+                }
+            ]
+        },
+        seed_url="https://vinwonders.com/vi/vinpearl-safari-phu-quoc/",
+        crawl_job_id="job-nav",
+    )
+
+    content = "\n".join(chunk.content for chunk in chunks)
+    assert "hoa hồng hấp dẫn" in content
+    assert "Đăng nhập" not in content
+    assert "Trang chủ" not in content
+    assert "Mục lục" not in content
+    assert "#intro" not in content
+
+
+def test_firecrawl_chunks_trim_wonderpedia_landing_to_primary_heading():
+    chunks = firecrawl_result_to_chunks(
+        result={
+            "data": [
+                {
+                    "markdown": "\n".join(
+                        [
+                            "Về Chúng Tôi",
+                            "Đặt vé VinWonders",
+                            "Chọn điểm đến",
+                            "# WONDERPEDIA",
+                            "Nơi mở ra những vùng đất diệu kỳ, câu chuyện lý thú, khoảnh khắc tuyệt hơn mơ…",
+                            "WonderCulture",
+                            "WonderLand",
+                            "WonderMoment",
+                            "WonderCreature",
+                        ]
+                    ),
+                    "metadata": {
+                        "title": "Wonderpedia | Cẩm Nang Du Lịch, Điểm Đến & Lịch Trình",
+                        "sourceURL": "https://vinwonders.com/vi/wonderpedia/",
+                        "url": "https://vinwonders.com/vi/wonderpedia/",
+                        "statusCode": 200,
+                    },
+                }
+            ]
+        },
+        seed_url="https://vinwonders.com/vi/vinpearl-safari-phu-quoc/",
+        crawl_job_id="job-wonderpedia",
+    )
+
+    assert chunks
+    assert chunks[0].category == "wonderpedia"
+    assert chunks[0].section == "WONDERPEDIA"
+    assert chunks[0].content.startswith("# WONDERPEDIA")
+    assert "Đặt vé VinWonders" not in chunks[0].content
 
 
 def test_firecrawl_section_falls_back_to_title_for_body_fragments():

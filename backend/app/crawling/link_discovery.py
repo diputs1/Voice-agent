@@ -56,10 +56,17 @@ class LinkDiscoveryAgent:
         self.include_subdomains = include_subdomains
         self.exclude_patterns = exclude_patterns or []
 
-    def discover_from_firecrawl_result(self, result: dict[str, Any]) -> LinkDiscoveryResult:
+    def discover_from_firecrawl_result(
+        self,
+        result: dict[str, Any],
+        *,
+        extra_urls: list[str] | None = None,
+    ) -> LinkDiscoveryResult:
         discovery = LinkDiscoveryResult()
         selected: dict[str, DiscoveredUrl] = {}
         candidates = self._candidates_from_result(result)
+        candidates.update(self._seed_entrypoint_candidates())
+        candidates.update(self._candidates_from_extra_urls(extra_urls or []))
         discovery.candidate_urls = list(candidates)
 
         for url, discovered_from in candidates.items():
@@ -80,9 +87,10 @@ class LinkDiscoveryAgent:
         scraper: FirecrawlScraper,
         *,
         max_scrapes: int,
+        extra_urls: list[str] | None = None,
         on_progress: DiscoveryProgressCallback | None = None,
     ) -> tuple[LinkDiscoveryResult, list[ScrapedDiscoveryPage]]:
-        discovery = self.discover_from_firecrawl_result(initial_result)
+        discovery = self.discover_from_firecrawl_result(initial_result, extra_urls=extra_urls)
         selected = {item.url: item for item in discovery.selected_urls}
         already_crawled = self._source_urls_from_result(initial_result)
         visited = set(already_crawled)
@@ -143,6 +151,14 @@ class LinkDiscoveryAgent:
         data = result.get("data") or result
         return self._candidates_from_result({"data": [data]})
 
+    def _candidates_from_extra_urls(self, urls: list[str]) -> dict[str, str | None]:
+        candidates: dict[str, str | None] = {}
+        for url in urls:
+            normalized = normalize_url(str(url))
+            if normalized:
+                candidates.setdefault(normalized, self.seed_url)
+        return candidates
+
     def _source_urls_from_result(self, result: dict[str, Any]) -> set[str]:
         urls = set()
         for item in result.get("data") or []:
@@ -152,6 +168,19 @@ class LinkDiscoveryAgent:
                 if normalized:
                     urls.add(normalized)
         return urls
+
+    def _seed_entrypoint_candidates(self) -> dict[str, str | None]:
+        parsed = urlparse(self.seed_url)
+        if not parsed.netloc.endswith("vinwonders.com"):
+            return {}
+        language = _language_prefix(parsed.path) or "/vi"
+        base = f"{parsed.scheme}://{parsed.netloc}{language}"
+        candidates = [
+            normalize_url(f"{base}/wonderpedia/"),
+            normalize_url(f"{base}/promotions/"),
+            normalize_url(f"{base}/uu-dai/"),
+        ]
+        return {url: self.seed_url for url in candidates if url}
 
     def _next_url_to_scrape(
         self,
@@ -239,6 +268,9 @@ def skip_reason(
 
 def classify_url_category(url: str) -> str | None:
     lowered = url.lower()
+    path = urlparse(lowered).path.rstrip("/")
+    if path.endswith("/wonderpedia"):
+        return "wonderpedia"
     if "affiliate" in lowered:
         return "affiliate"
     if "vinclub" in lowered or "hoi-vien" in lowered:
@@ -276,14 +308,20 @@ def sorted_selected_urls(selected: dict[str, DiscoveredUrl]) -> list[DiscoveredU
 def _category_rank(category: str) -> int:
     ranks = {
         "experience": 0,
-        "price": 1,
-        "offer": 2,
-        "vinclub": 3,
-        "affiliate": 4,
-        "booking": 5,
-        "service": 6,
+        "wonderpedia": 1,
+        "price": 2,
+        "offer": 3,
+        "vinclub": 4,
+        "affiliate": 5,
+        "booking": 6,
+        "service": 7,
     }
     return ranks.get(category, 99)
+
+
+def _language_prefix(path: str) -> str | None:
+    match = re.match(r"^/(vi|en)(?:/|$)", path.lower())
+    return f"/{match.group(1)}" if match else None
 
 
 def _host_allowed(host: str, domains: list[str], include_subdomains: bool) -> bool:

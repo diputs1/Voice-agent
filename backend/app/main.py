@@ -5,7 +5,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from app.core.config import get_settings
 from app.routers import admin, chat, health
-from app.services.app_factory import initialize_app_state
+from app.services.app_factory import initialize_app_state, shutdown_app_state
 
 settings = get_settings()
 
@@ -25,3 +25,8 @@ app.include_router(admin.router)
 @app.on_event("startup")
 async def startup() -> None:
     await initialize_app_state(app, settings)
+
+
+@app.on_event("shutdown")
+async def shutdown() -> None:
+    await shutdown_app_state(app)

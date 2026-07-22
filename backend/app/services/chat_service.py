@@ -54,12 +54,13 @@ class ChatService:
                 yield sse("status", {"thread_id": thread_id, "node": "cache_hit"})
                 yield sse("token", {"text": answer})
             else:
-                answer = ""
+                answer_parts: list[str] = []
                 yield sse("status", {"thread_id": thread_id, "node": "voice_answer"})
                 async for token in self.agent_graph.astream_voice_answer_tokens(final_state):
-                    answer += token
+                    answer_parts.append(token)
                     yield sse("token", {"text": token})
 
+                answer = "".join(answer_parts)
                 final_update = self.agent_graph.finalize_streamed_answer(final_state, answer)
                 final_state = {**final_state, **final_update}
                 final_answer = final_state.get("answer", answer)

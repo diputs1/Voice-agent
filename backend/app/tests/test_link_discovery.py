@@ -4,6 +4,7 @@ from app.crawling.link_discovery import LinkDiscoveryAgent, classify_url_categor
 
 
 def test_classifies_vin_url_categories():
+    assert classify_url_category("https://vinwonders.com/vi/wonderpedia/") == "wonderpedia"
     assert (
         classify_url_category(
             "https://vinwonders.com/vi/wonderpedia/news/ra-mat-chuong-trinh-vinwonders-affiliate"
@@ -49,6 +50,7 @@ def test_discovers_firecrawl_links_without_static_fallbacks():
 
     selected = {item.url: item for item in discovery.selected_urls}
     assert normalize_url("https://vinwonders.com/vi/vinpearl-safari-phu-quoc/") in selected
+    assert normalize_url("https://vinwonders.com/vi/wonderpedia/") in selected
     assert normalize_url("https://vinwonders.com/vi/promotions/?utm_source=test") in selected
     assert (
         normalize_url("https://vinwonders.com/vi/wonderpedia/news/ra-mat-chuong-trinh-vinwonders-affiliate/")
@@ -56,6 +58,36 @@ def test_discovers_firecrawl_links_without_static_fallbacks():
     )
     assert "https://vinwonders.com/ru/promotions" in discovery.skip_reasons
     assert "https://example.com/vi/vinpearl-safari-phu-quoc" in discovery.skip_reasons
+
+
+def test_discovers_firecrawl_map_urls_as_candidates():
+    result = {
+        "data": [
+            {
+                "links": [],
+                "metadata": {
+                    "sourceURL": "https://vinwonders.com/vi/vinpearl-safari-phu-quoc/",
+                    "url": "https://vinwonders.com/vi/vinpearl-safari-phu-quoc/",
+                },
+            }
+        ]
+    }
+
+    discovery = LinkDiscoveryAgent(
+        seed_url="https://vinwonders.com/vi/vinpearl-safari-phu-quoc/",
+    ).discover_from_firecrawl_result(
+        result,
+        extra_urls=[
+            "https://vinwonders.com/vi/wonderpedia/news/voucher-vinpearl-safari-phu-quoc/",
+            "https://vinwonders.com/ko/wonderpedia/",
+        ],
+    )
+
+    selected = {item.url: item for item in discovery.selected_urls}
+    voucher_url = "https://vinwonders.com/vi/wonderpedia/news/voucher-vinpearl-safari-phu-quoc"
+    assert voucher_url in selected
+    assert selected[voucher_url].discovered_from == "https://vinwonders.com/vi/vinpearl-safari-phu-quoc"
+    assert "https://vinwonders.com/ko/wonderpedia" in discovery.skip_reasons
 
 
 @pytest.mark.asyncio
@@ -75,6 +107,16 @@ async def test_agent_scrapes_selected_links_and_expands_from_scraped_page():
     }
     scraper = FakeFirecrawlScraper(
         {
+            "https://vinwonders.com/vi/wonderpedia": {
+                "data": {
+                    "markdown": "# WONDERPEDIA\nNơi mở ra những vùng đất diệu kỳ.",
+                    "links": [],
+                    "metadata": {
+                        "sourceURL": "https://vinwonders.com/vi/wonderpedia/",
+                        "url": "https://vinwonders.com/vi/wonderpedia/",
+                    },
+                }
+            },
             "https://vinwonders.com/vi/promotions": {
                 "data": {
                     "markdown": "# Promotions\nƯu đãi Safari.",
@@ -82,6 +124,16 @@ async def test_agent_scrapes_selected_links_and_expands_from_scraped_page():
                     "metadata": {
                         "sourceURL": "https://vinwonders.com/vi/promotions/",
                         "url": "https://vinwonders.com/vi/promotions/",
+                    },
+                }
+            },
+            "https://vinwonders.com/vi/uu-dai": {
+                "data": {
+                    "markdown": "# Ưu đãi\nCác chương trình ưu đãi VinWonders.",
+                    "links": [],
+                    "metadata": {
+                        "sourceURL": "https://vinwonders.com/vi/uu-dai/",
+                        "url": "https://vinwonders.com/vi/uu-dai/",
                     },
                 }
             },
@@ -100,10 +152,12 @@ async def test_agent_scrapes_selected_links_and_expands_from_scraped_page():
 
     discovery, scraped_pages = await LinkDiscoveryAgent(
         seed_url="https://vinwonders.com/vi/vinpearl-safari-phu-quoc/",
-    ).discover_and_scrape(result, scraper, max_scrapes=2)
+    ).discover_and_scrape(result, scraper, max_scrapes=4)
 
     assert scraper.scraped_urls == [
+        "https://vinwonders.com/vi/wonderpedia",
         "https://vinwonders.com/vi/promotions",
+        "https://vinwonders.com/vi/uu-dai",
         "https://vinwonders.com/vi/uu-dai/vinwonders-uu-dai-15-hoi-vien-vinclub",
     ]
     assert [page.discovered_url.url for page in scraped_pages] == scraper.scraped_urls

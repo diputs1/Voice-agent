@@ -24,6 +24,24 @@ async def test_schedule_question_routes_to_answer():
 
 
 @pytest.mark.asyncio
+async def test_vinsafari_product_question_answers_from_knowledge():
+    settings = Settings(openai_api_key=None)
+    kb = InMemoryKnowledgeBase(EmbeddingProvider(None, "text-embedding-3-small"))
+    await kb.ensure_ready()
+    graph = SafariAgentGraph(kb, settings)
+
+    result = await graph.ainvoke({"transcript": "Các sản phẩm của VinSafari Phú Quốc."}, "products-thread")
+
+    assert result["intent"] == "stable"
+    assert result["suggested_route"] == "safari_knowledge"
+    assert "sản phẩm" in result["intent_entities"]
+    assert result["handoff_required"] is False
+    assert result["retrieved_context"]
+    assert "sản phẩm/dịch vụ" in result["answer"].lower()
+    assert "kid zoo" in result["answer"].lower()
+
+
+@pytest.mark.asyncio
 async def test_ticket_price_question_requires_handoff():
     settings = Settings(openai_api_key=None)
     kb = InMemoryKnowledgeBase(EmbeddingProvider(None, "text-embedding-3-small"))
@@ -66,6 +84,40 @@ async def test_paraphrased_time_sensitive_questions_use_rules_fast_path(question
     assert result["suggested_route"] == "safari_knowledge"
     assert result["retrieval_debug"]["candidate_count"] > 0
     assert result["handoff_required"] is True
+
+
+@pytest.mark.asyncio
+async def test_affiliate_info_question_answers_without_noisy_handoff():
+    settings = Settings(openai_api_key=None)
+    kb = AffiliateKnowledgeBase(EmbeddingProvider(None, "text-embedding-3-small"))
+    await kb.ensure_ready()
+    graph = SafariAgentGraph(kb, settings)
+
+    result = await graph.ainvoke({"transcript": "Thông tin về affiliate"}, "affiliate-thread")
+
+    assert result["intent"] == "stable"
+    assert result["suggested_route"] == "safari_knowledge"
+    assert result["handoff_required"] is False
+    assert "hoa hồng hấp dẫn" in result["answer"]
+    assert "Đăng nhập" not in result["answer"]
+    assert "Mục lục" not in result["answer"]
+    assert "Trang chủ" not in result["answer"]
+
+
+@pytest.mark.asyncio
+async def test_wonderpedia_info_question_uses_wonderpedia_landing_context():
+    settings = Settings(openai_api_key=None)
+    kb = WonderpediaKnowledgeBase(EmbeddingProvider(None, "text-embedding-3-small"))
+    await kb.ensure_ready()
+    graph = SafariAgentGraph(kb, settings)
+
+    result = await graph.ainvoke({"transcript": "Thông tin về Wonderpedia"}, "wonderpedia-thread")
+
+    assert result["intent"] == "stable"
+    assert result["handoff_required"] is False
+    assert "cẩm nang" in result["answer"].lower()
+    assert "voucher" not in result["answer"].lower()
+    assert result["citations"][0]["category"] == "wonderpedia"
 
 
 @pytest.mark.asyncio
@@ -423,6 +475,75 @@ class RetryThenAnswerKnowledgeBase(InMemoryKnowledgeBase):
                 metadata={},
                 score=0.9,
             )
+        ]
+
+
+class AffiliateKnowledgeBase(InMemoryKnowledgeBase):
+    async def search(self, query: str, limit: int = 5):
+        return [
+            KnowledgeHit(
+                id="affiliate",
+                title="VinWonders chính thức ra mắt VinWonders Affiliate",
+                section="VinWonders chính thức ra mắt VinWonders Affiliate",
+                category="affiliate",
+                content="\n".join(
+                    [
+                        "vi",
+                        "[Đăng nhập](https://booking.vinwonders.com/login?redirectUri=https://vinwonders.com/demo)",
+                        "[Đăng ký](https://booking.vinwonders.com/login?tab=register&redirectUri=https://vinwonders.com/demo)",
+                        "- [Trang chủ](https://vinwonders.com/)",
+                        "- Wonderpedia",
+                        "- Bài viết",
+                        "# VinWonders chính thức ra mắt VinWonders Affiliate",
+                        "VinWonders Affiliate có cơ chế hoa hồng hấp dẫn, chính sách thưởng đa dạng và bộ tài nguyên truyền thông sẵn có.",
+                        "Mục lục",
+                        "- [1 . Giới thiệu chương trình VinWonders Affiliate](https://vinwonders.com/demo#intro)",
+                    ]
+                ),
+                source_url="https://vinwonders.com/vi/wonderpedia/news/ra-mat-chuong-trinh-vinwonders-affiliate/",
+                language="vi",
+                crawled_at=None,
+                valid_until=None,
+                metadata={},
+                score=0.9,
+            )
+        ]
+
+
+class WonderpediaKnowledgeBase(InMemoryKnowledgeBase):
+    async def search(self, query: str, limit: int = 5):
+        return [
+            KnowledgeHit(
+                id="wonderpedia",
+                title="Wonderpedia | Cẩm Nang Du Lịch, Điểm Đến & Lịch Trình",
+                section="WONDERPEDIA",
+                category="wonderpedia",
+                content=(
+                    "WONDERPEDIA\n"
+                    "Nơi mở ra những vùng đất diệu kỳ, câu chuyện lý thú, khoảnh khắc tuyệt hơn mơ…\n"
+                    "Cùng VinWonders khám phá ngay thôi!\n"
+                    "WonderCulture WonderLand WonderMoment WonderCreature Tin công ty"
+                ),
+                source_url="https://vinwonders.com/vi/wonderpedia/",
+                language="vi",
+                crawled_at=None,
+                valid_until=None,
+                metadata={},
+                score=0.95,
+            ),
+            KnowledgeHit(
+                id="voucher",
+                title="Voucher Vinpearl Safari Phú Quốc ưu đãi và bí quyết săn 2026",
+                section="Voucher",
+                category="booking",
+                content="Thông tin về voucher/combo Vinpearl Safari Phú Quốc giá hời.",
+                source_url="https://vinwonders.com/vi/wonderpedia/news/voucher-vinpearl-safari-phu-quoc/",
+                language="vi",
+                crawled_at=None,
+                valid_until=None,
+                metadata={},
+                score=0.8,
+            ),
         ]
 
 

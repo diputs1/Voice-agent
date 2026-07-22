@@ -3,13 +3,17 @@ from __future__ import annotations
 import json
 import re
 import unicodedata
+from contextlib import asynccontextmanager
 from hashlib import sha256
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
+from collections.abc import AsyncIterator
 from typing import Protocol
 from urllib.parse import urlparse
 
 import psycopg
+from psycopg import AsyncConnection
+from psycopg_pool import AsyncConnectionPool
 from psycopg.rows import dict_row
 from langsmith import traceable
 
@@ -19,13 +23,39 @@ from app.core.sites import canonical_root_url, relevance_profile_for_text, site_
 
 
 CATEGORY_KEYWORDS = {
+    "wonderpedia": ("wonderpedia", "wonderculture", "wonderland", "wondermoment", "wondercreature"),
     "affiliate": ("affiliate", "hoa hồng", "đối tác"),
     "vinclub": ("vinclub", "hội viên", "gold", "platinum", "diamond"),
     "offer": ("ưu đãi", "voucher", "khuyến mãi", "giảm", "hạn áp dụng"),
     "price": ("giá", "giá vé", "bảng giá", "vnđ", "vnd"),
-    "booking": ("booking", "đặt vé", "đặt online", "qr"),
+    "booking": (
+        "booking",
+        "đặt vé",
+        "đặt online",
+        "qr",
+        "sản phẩm",
+        "san pham",
+        "product",
+        "products",
+        "gói",
+        "combo",
+        "tour",
+        "onsite service",
+    ),
     "schedule": ("giờ", "mở cửa", "lịch", "lúc nào", "thời gian"),
-    "experience": ("show", "biểu diễn", "động vật", "animal", "night safari", "kid zoo"),
+    "experience": (
+        "show",
+        "biểu diễn",
+        "động vật",
+        "animal",
+        "night safari",
+        "kid zoo",
+        "trải nghiệm",
+        "tham quan",
+        "sản phẩm",
+        "san pham",
+        "tour",
+    ),
 }
 
 
@@ -43,6 +73,15 @@ class KnowledgeHit:
     metadata: dict | None
     score: float
     site_id: str | None = None
+
+
+@dataclass(frozen=True)
+class SearchContext:
+    raw_query: str
+    normalized_query: str
+    query_tokens: frozenset[str]
+    query_lower: str
+    wanted_categories: tuple[str, ...]
 
 
 class KnowledgeBase(Protocol):
@@ -118,20 +157,21 @@ class InMemoryKnowledgeBase:
 
     @traceable(name="kb.in_memory_search")
     async def search(self, query: str, limit: int = 5, site_id: str | None = None) -> list[KnowledgeHit]:
+        context = _search_context(query)
         query_vector = await self.embeddings.embed_query(query)
         vector_ranked = []
         lexical_ranked = []
         for row in self.rows:
             if site_id and row.get("site_id") != site_id:
                 continue
-            confidence = _adjusted_score(query, row, _cosine(query_vector, row["embedding"]))
-            lexical = _lexical_score(query, row)
+            confidence = _adjusted_score(context, row, _cosine(query_vector, row["embedding"]))
+            lexical = _lexical_score(context, row)
             vector_ranked.append((confidence, row, confidence))
             if lexical > 0:
                 lexical_confidence = _confidence_with_lexical_score(confidence, lexical)
                 lexical_ranked.append((lexical_confidence, row, lexical_confidence))
         fused = _rrf_fuse(vector_ranked, lexical_ranked, limit=max(limit * 6, 20))
-        scored = _diversify_categories(query, fused, limit)
+        scored = _diversify_categories(context, fused, limit)
         return [
             KnowledgeHit(
                 id=row["id"],
@@ -208,12 +248,35 @@ class InMemoryKnowledgeBase:
 
 
 class PostgresKnowledgeBase:
-    def __init__(self, database_url: str, embeddings: EmbeddingProvider) -> None:
+    def __init__(
+        self,
+        database_url: str,
+        embeddings: EmbeddingProvider,
+        *,
+        pool: AsyncConnectionPool | None = None,
+    ) -> None:
         self.database_url = database_url
         self.embeddings = embeddings
+        self.pool = pool
+
+    @asynccontextmanager
+    async def _connection(
+        self,
+        *,
+        autocommit: bool = False,
+    ) -> AsyncIterator[AsyncConnection]:
+        if self.pool:
+            async with self.pool.connection() as conn:
+                yield conn
+            return
+        async with await psycopg.AsyncConnection.connect(
+            self.database_url,
+            autocommit=autocommit,
+        ) as conn:
+            yield conn
 
     async def ensure_ready(self) -> None:
-        async with await psycopg.AsyncConnection.connect(self.database_url, autocommit=True) as conn:
+        async with self._connection(autocommit=True) as conn:
             await conn.execute("CREATE EXTENSION IF NOT EXISTS pgcrypto")
             await conn.execute("CREATE EXTENSION IF NOT EXISTS vector")
             await conn.execute(
@@ -292,6 +355,12 @@ class PostgresKnowledgeBase:
             )
             await conn.execute("CREATE INDEX IF NOT EXISTS documents_site_idx ON documents (site_id)")
             await conn.execute(
+                """
+                CREATE INDEX IF NOT EXISTS thread_turns_thread_created_idx
+                ON thread_turns (thread_id, created_at ASC, id ASC)
+                """
+            )
+            await conn.execute(
                 "CREATE INDEX IF NOT EXISTS documents_metadata_idx ON documents USING gin (metadata)"
             )
             await conn.execute(
@@ -310,7 +379,7 @@ class PostgresKnowledgeBase:
             site_sources.setdefault(chunk_site_id, chunk.source_url)
             prepared_rows.append((chunk_site_id, chunk, vector))
 
-        async with await psycopg.AsyncConnection.connect(self.database_url, autocommit=True) as conn:
+        async with self._connection(autocommit=True) as conn:
             for chunk_site_id, source_url in site_sources.items():
                 await self._upsert_site_for_chunk(conn, chunk_site_id, source_url)
 
@@ -352,90 +421,50 @@ class PostgresKnowledgeBase:
 
     @traceable(name="kb.postgres_search")
     async def search(self, query: str, limit: int = 5, site_id: str | None = None) -> list[KnowledgeHit]:
-        vector = await self.embeddings.embed_query(query)
-        query_text = _normalize_text(query)
-        site_filter = "WHERE d.site_id = %s" if site_id else ""
-        async with await psycopg.AsyncConnection.connect(self.database_url, row_factory=dict_row) as conn:
-            vector_cursor = await conn.execute(
-                f"""
-                SELECT d.id::text, d.site_id, d.title, d.section, d.category, d.content,
-                       d.source_url, d.language, d.crawled_at::text, d.valid_until::text,
-                       d.metadata, COALESCE(s.site_aliases, ARRAY[]::text[]) AS site_aliases,
-                       1 - (d.embedding <=> %s::vector) AS score
-                FROM documents d
-                LEFT JOIN sites s ON s.site_id = d.site_id
-                {site_filter}
-                ORDER BY d.embedding <=> %s::vector
-                LIMIT %s
-                """,
-                (pgvector_literal(vector), site_id, pgvector_literal(vector), max(limit * 6, 20))
-                if site_id
-                else (pgvector_literal(vector), pgvector_literal(vector), max(limit * 6, 20)),
+        context = _search_context(query)
+        vector = await _trace_embed_query(self.embeddings, query)
+        candidate_limit = max(limit * 6, 20)
+        async with self._connection() as conn:
+            rows = await _trace_hybrid_sql(
+                conn=conn,
+                context=context,
+                vector=vector,
+                candidate_limit=candidate_limit,
+                site_id=site_id,
             )
-            vector_rows = await vector_cursor.fetchall()
-            lexical_rows = []
-            if query_text:
-                lexical_cursor = await conn.execute(
-                    f"""
-                    SELECT d.id::text, d.site_id, d.title, d.section, d.category, d.content,
-                           d.source_url, d.language, d.crawled_at::text, d.valid_until::text,
-                           d.metadata, COALESCE(s.site_aliases, ARRAY[]::text[]) AS site_aliases,
-                           ts_rank_cd(d.search_vector, websearch_to_tsquery('simple', %s)) AS lexical_score,
-                           1 - (d.embedding <=> %s::vector) AS score
-                    FROM documents d
-                    LEFT JOIN sites s ON s.site_id = d.site_id
-                    WHERE {'d.site_id = %s AND ' if site_id else ''}d.search_vector @@ websearch_to_tsquery('simple', %s)
-                    ORDER BY lexical_score DESC
-                    LIMIT %s
-                    """,
-                    (query_text, pgvector_literal(vector), site_id, query_text, max(limit * 6, 20))
-                    if site_id
-                    else (query_text, pgvector_literal(vector), query_text, max(limit * 6, 20)),
-                )
-                lexical_rows = await lexical_cursor.fetchall()
-        vector_ranked = []
-        for row in vector_rows:
-            item = dict(row)
-            confidence = _adjusted_score(query, item, float(item["score"]))
-            vector_ranked.append((confidence, item, confidence))
-        lexical_ranked = []
-        for row in lexical_rows:
-            item = dict(row)
-            confidence = _adjusted_score(query, item, float(item["score"]))
-            lexical_confidence = _confidence_with_lexical_score(
-                confidence,
-                float(item["lexical_score"]),
-            )
-            lexical_ranked.append((lexical_confidence, item, lexical_confidence))
-        fused = _rrf_fuse(vector_ranked, lexical_ranked, limit=max(limit * 6, 20))
-        reranked = [row for _, row in _diversify_categories(query, fused, limit)]
-        return [_knowledge_hit_from_row(row) for row in reranked[:limit]]
+        return await _trace_rerank_results(
+            context=context,
+            rows=rows,
+            limit=limit,
+            candidate_limit=candidate_limit,
+        )
 
     async def save_thread_turn(
         self, thread_id: str, transcript: str, answer: str, site_id: str | None = None
     ) -> None:
-        async with await psycopg.AsyncConnection.connect(self.database_url, autocommit=True) as conn:
+        async with self._connection(autocommit=True) as conn:
             await conn.execute(
                 "INSERT INTO thread_turns (thread_id, site_id, transcript, answer) VALUES (%s, %s, %s, %s)",
                 (thread_id, site_id, transcript, answer),
             )
 
     async def get_thread(self, thread_id: str) -> list[dict]:
-        async with await psycopg.AsyncConnection.connect(self.database_url, row_factory=dict_row) as conn:
-            cursor = await conn.execute(
-                """
-                SELECT site_id, transcript, answer, created_at::text
-                FROM thread_turns
-                WHERE thread_id = %s
-                ORDER BY created_at ASC, id ASC
-                """,
-                (thread_id,),
-            )
-            rows = await cursor.fetchall()
-            return list(rows)
+        async with self._connection() as conn:
+            async with conn.cursor(row_factory=dict_row) as cur:
+                await cur.execute(
+                    """
+                    SELECT site_id, transcript, answer, created_at::text
+                    FROM thread_turns
+                    WHERE thread_id = %s
+                    ORDER BY created_at ASC, id ASC
+                    """,
+                    (thread_id,),
+                )
+                rows = await cur.fetchall()
+                return list(rows)
 
     async def doc_set_hash(self, site_id: str | None = None) -> str:
-        async with await psycopg.AsyncConnection.connect(self.database_url) as conn:
+        async with self._connection() as conn:
             cursor = await conn.execute(
                 f"""
                 SELECT md5(coalesce(string_agg(content_hash, ',' ORDER BY content_hash), ''))
@@ -457,7 +486,7 @@ class PostgresKnowledgeBase:
         site_aliases: list[str] | None = None,
         crawl_policy: dict | None = None,
     ) -> None:
-        async with await psycopg.AsyncConnection.connect(self.database_url, autocommit=True) as conn:
+        async with self._connection(autocommit=True) as conn:
             await conn.execute(
                 """
                 INSERT INTO sites (site_id, root_url, allowed_domains, site_aliases, crawl_policy)
@@ -479,49 +508,50 @@ class PostgresKnowledgeBase:
             )
 
     async def site_status(self, site_id: str | None = None) -> dict:
-        async with await psycopg.AsyncConnection.connect(self.database_url, row_factory=dict_row) as conn:
-            site_cursor = await conn.execute(
-                """
-                SELECT site_id, root_url, allowed_domains, site_aliases, crawl_policy,
-                       created_at::text, updated_at::text
-                FROM sites
-                WHERE (%s::text IS NULL OR site_id = %s)
-                ORDER BY updated_at DESC
-                """,
-                (site_id, site_id),
-            )
-            site_rows = await site_cursor.fetchall()
-            category_cursor = await conn.execute(
-                """
-                SELECT category, count(*) AS count
-                FROM documents
-                WHERE (%s::text IS NULL OR site_id = %s)
-                GROUP BY category
-                ORDER BY count DESC, category ASC
-                """,
-                (site_id, site_id),
-            )
-            category_rows = await category_cursor.fetchall()
-            doc_cursor = await conn.execute(
-                """
-                SELECT count(*) AS count, max(crawled_at)::text AS latest_crawl
-                FROM documents
-                WHERE (%s::text IS NULL OR site_id = %s)
-                """,
-                (site_id, site_id),
-            )
-            doc_count = await doc_cursor.fetchone()
-            stale_cursor = await conn.execute(
-                """
-                SELECT count(*) AS count
-                FROM documents
-                WHERE (%s::text IS NULL OR site_id = %s)
-                  AND valid_until IS NOT NULL
-                  AND valid_until < now()
-                """,
-                (site_id, site_id),
-            )
-            stale_count = await stale_cursor.fetchone()
+        async with self._connection() as conn:
+            async with conn.cursor(row_factory=dict_row) as cur:
+                await cur.execute(
+                    """
+                    SELECT site_id, root_url, allowed_domains, site_aliases, crawl_policy,
+                           created_at::text, updated_at::text
+                    FROM sites
+                    WHERE (%s::text IS NULL OR site_id = %s)
+                    ORDER BY updated_at DESC
+                    """,
+                    (site_id, site_id),
+                )
+                site_rows = await cur.fetchall()
+                await cur.execute(
+                    """
+                    SELECT category, count(*) AS count
+                    FROM documents
+                    WHERE (%s::text IS NULL OR site_id = %s)
+                    GROUP BY category
+                    ORDER BY count DESC, category ASC
+                    """,
+                    (site_id, site_id),
+                )
+                category_rows = await cur.fetchall()
+                await cur.execute(
+                    """
+                    SELECT count(*) AS count, max(crawled_at)::text AS latest_crawl
+                    FROM documents
+                    WHERE (%s::text IS NULL OR site_id = %s)
+                    """,
+                    (site_id, site_id),
+                )
+                doc_count = await cur.fetchone()
+                await cur.execute(
+                    """
+                    SELECT count(*) AS count
+                    FROM documents
+                    WHERE (%s::text IS NULL OR site_id = %s)
+                      AND valid_until IS NOT NULL
+                      AND valid_until < now()
+                    """,
+                    (site_id, site_id),
+                )
+                stale_count = await cur.fetchone()
         return {
             "site_id": site_id,
             "sites": [dict(row) for row in site_rows],
@@ -582,6 +612,179 @@ def _ivfflat_lists(document_count: int) -> int:
     if document_count < 1_000:
         return 1
     return max(1, min(100, document_count // 1_000))
+
+
+def _hybrid_search_sql(*, site_id: str | None, include_lexical: bool) -> str:
+    site_filter = "WHERE d.site_id = %s" if site_id else ""
+    lexical_site_filter = "d.site_id = %s AND " if site_id else ""
+    lexical_cte = (
+        f"""
+        lexical_matches AS (
+          SELECT d.id::text, d.site_id, d.title, d.section, d.category, d.content,
+                 d.source_url, d.language, d.crawled_at::text, d.valid_until::text,
+                 d.metadata, COALESCE(s.site_aliases, ARRAY[]::text[]) AS site_aliases,
+                 ts_rank_cd(d.search_vector, websearch_to_tsquery('simple', %s)) AS lexical_score,
+                 1 - (d.embedding <=> %s::vector) AS score,
+                 'lexical' AS match_source
+          FROM documents d
+          LEFT JOIN sites s ON s.site_id = d.site_id
+          WHERE {lexical_site_filter}d.search_vector @@ websearch_to_tsquery('simple', %s)
+          ORDER BY lexical_score DESC
+          LIMIT %s
+        )
+        """
+        if include_lexical
+        else """
+        lexical_matches AS (
+          SELECT * FROM vector_matches WHERE false
+        )
+        """
+    )
+    return f"""
+        WITH vector_matches AS (
+          SELECT d.id::text, d.site_id, d.title, d.section, d.category, d.content,
+                 d.source_url, d.language, d.crawled_at::text, d.valid_until::text,
+                 d.metadata, COALESCE(s.site_aliases, ARRAY[]::text[]) AS site_aliases,
+                 NULL::double precision AS lexical_score,
+                 1 - (d.embedding <=> %s::vector) AS score,
+                 'vector' AS match_source
+          FROM documents d
+          LEFT JOIN sites s ON s.site_id = d.site_id
+          {site_filter}
+          ORDER BY d.embedding <=> %s::vector
+          LIMIT %s
+        ),
+        {lexical_cte}
+        SELECT * FROM vector_matches
+        UNION ALL
+        SELECT * FROM lexical_matches
+        """
+
+
+def _hybrid_search_params(
+    *,
+    vector: list[float],
+    query_text: str,
+    candidate_limit: int,
+    site_id: str | None,
+) -> tuple[object, ...]:
+    vector_literal = pgvector_literal(vector)
+    params: list[object] = [vector_literal]
+    if site_id:
+        params.append(site_id)
+    params.extend([vector_literal, candidate_limit])
+    if query_text:
+        params.append(query_text)
+        params.append(vector_literal)
+        if site_id:
+            params.append(site_id)
+        params.extend([query_text, candidate_limit])
+    return tuple(params)
+
+
+@traceable(
+    name="kb.embed_query",
+    run_type="retriever",
+    process_inputs=lambda inputs: {
+        "query": inputs.get("query", ""),
+        "query_length": len(str(inputs.get("query", ""))),
+    },
+    process_outputs=lambda output: {"dimensions": len(output)},
+)
+async def _trace_embed_query(embeddings: EmbeddingProvider, query: str) -> list[float]:
+    return await embeddings.embed_query(query)
+
+
+@traceable(
+    name="kb.hybrid_sql",
+    run_type="retriever",
+    process_inputs=lambda inputs: {
+        "query_text": inputs["context"].normalized_query,
+        "candidate_limit": inputs["candidate_limit"],
+        "site_id": inputs.get("site_id"),
+        "vector_dimensions": len(inputs["vector"]),
+        "include_lexical": bool(inputs["context"].normalized_query),
+    },
+    process_outputs=lambda rows: {
+        "row_count": len(rows),
+        "vector_row_count": sum(1 for row in rows if row.get("match_source") == "vector"),
+        "lexical_row_count": sum(1 for row in rows if row.get("match_source") == "lexical"),
+    },
+)
+async def _trace_hybrid_sql(
+    *,
+    conn: AsyncConnection,
+    context: SearchContext,
+    vector: list[float],
+    candidate_limit: int,
+    site_id: str | None,
+) -> list[dict]:
+    async with conn.cursor(row_factory=dict_row) as cur:
+        await cur.execute(
+            _hybrid_search_sql(site_id=site_id, include_lexical=bool(context.normalized_query)),
+            _hybrid_search_params(
+                vector=vector,
+                query_text=context.normalized_query,
+                candidate_limit=candidate_limit,
+                site_id=site_id,
+            ),
+        )
+        rows = await cur.fetchall()
+    return [dict(row) for row in rows]
+
+
+@traceable(
+    name="kb.rerank_results",
+    run_type="chain",
+    process_inputs=lambda inputs: {
+        "query_text": inputs["context"].normalized_query,
+        "row_count": len(inputs["rows"]),
+        "limit": inputs["limit"],
+        "candidate_limit": inputs["candidate_limit"],
+    },
+    process_outputs=lambda hits: {
+        "hit_count": len(hits),
+        "top_score": hits[0].score if hits else None,
+        "top_category": hits[0].category if hits else None,
+        "top_source_url": hits[0].source_url if hits else None,
+    },
+)
+async def _trace_rerank_results(
+    *,
+    context: SearchContext,
+    rows: list[dict],
+    limit: int,
+    candidate_limit: int,
+) -> list[KnowledgeHit]:
+    vector_rows = []
+    lexical_rows = []
+    for row in rows:
+        item = dict(row)
+        match_source = item.pop("match_source", "")
+        if match_source == "lexical":
+            lexical_rows.append(item)
+        else:
+            vector_rows.append(item)
+
+    vector_ranked = []
+    for row in vector_rows:
+        item = dict(row)
+        confidence = _adjusted_score(context, item, float(item["score"]))
+        vector_ranked.append((confidence, item, confidence))
+
+    lexical_ranked = []
+    for row in lexical_rows:
+        item = dict(row)
+        confidence = _adjusted_score(context, item, float(item["score"]))
+        lexical_confidence = _confidence_with_lexical_score(
+            confidence,
+            float(item["lexical_score"]),
+        )
+        lexical_ranked.append((lexical_confidence, item, lexical_confidence))
+
+    fused = _rrf_fuse(vector_ranked, lexical_ranked, limit=candidate_limit)
+    reranked = [row for _, row in _diversify_categories(context, fused, limit)]
+    return [_knowledge_hit_from_row(row) for row in reranked[:limit]]
 
 
 def _knowledge_hit_from_row(row: dict) -> KnowledgeHit:
@@ -645,6 +848,17 @@ def _search_text(row: dict) -> str:
     return _normalize_text(text)
 
 
+def _search_context(query: str) -> SearchContext:
+    normalized_query = _normalize_text(query)
+    return SearchContext(
+        raw_query=query,
+        normalized_query=normalized_query,
+        query_tokens=frozenset(_lexical_tokens(normalized_query)),
+        query_lower=query.lower(),
+        wanted_categories=tuple(_wanted_categories(query)),
+    )
+
+
 def _normalize_text(value: str) -> str:
     decomposed = unicodedata.normalize("NFD", value.lower())
     without_marks = "".join(char for char in decomposed if unicodedata.category(char) != "Mn")
@@ -652,17 +866,17 @@ def _normalize_text(value: str) -> str:
     return " ".join(re.findall(r"[a-z0-9]+", asciiish))
 
 
-def _lexical_score(query: str, row: dict) -> float:
-    query_text = _normalize_text(query)
-    if not query_text:
+def _lexical_score(query: str | SearchContext, row: dict) -> float:
+    context = _coerce_search_context(query)
+    if not context.normalized_query:
         return 0.0
     search_text = str(row.get("search_text") or _search_text(row))
-    query_tokens = _lexical_tokens(query_text)
+    query_tokens = context.query_tokens
     search_tokens = _lexical_tokens(search_text)
     if not query_tokens or not search_tokens:
         return 0.0
     overlap = len(query_tokens & search_tokens)
-    phrase_bonus = 2.0 if query_text in search_text else 0.0
+    phrase_bonus = 2.0 if context.normalized_query in search_text else 0.0
     return float(overlap) + phrase_bonus
 
 
@@ -670,25 +884,25 @@ def _lexical_tokens(value: str) -> set[str]:
     return {token for token in value.split() if len(token) >= 2}
 
 
-def _keyword_score(query: str, row: dict) -> float:
+def _keyword_score(query: str | SearchContext, row: dict) -> float:
+    context = _coerce_search_context(query)
     haystack = " ".join(
         str(row.get(key, "")) for key in ("title", "section", "category", "content", "source_url")
     ).lower()
-    query_lower = query.lower()
     score = 0.0
     for category, keywords in CATEGORY_KEYWORDS.items():
-        if any(keyword in query_lower for keyword in keywords):
+        if any(keyword in context.query_lower for keyword in keywords):
             if row.get("category") == category:
                 score += 0.45
             if any(keyword in haystack for keyword in keywords):
                 score += 0.25
-    for token in set(query_lower.split()):
+    for token in set(context.query_lower.split()):
         if len(token) >= 4 and token in haystack:
             score += 0.03
     return score
 
 
-def _adjusted_score(query: str, row: dict, base_score: float) -> float:
+def _adjusted_score(query: str | SearchContext, row: dict, base_score: float) -> float:
     return base_score + _keyword_score(query, row) + _site_relevance_score(query, row)
 
 
@@ -697,8 +911,9 @@ def _confidence_with_lexical_score(confidence: float, lexical_score: float) -> f
     return confidence + lexical_boost
 
 
-def _site_relevance_score(query: str, row: dict) -> float:
-    query_lower = query.lower()
+def _site_relevance_score(query: str | SearchContext, row: dict) -> float:
+    context = _coerce_search_context(query)
+    query_lower = context.query_lower
     haystack = " ".join(
         str(row.get(key, "")) for key in ("title", "section", "category", "content", "source_url")
     ).lower()
@@ -751,8 +966,13 @@ def _looks_vietnamese(value: str) -> bool:
     )
 
 
-def _diversify_categories(query: str, scored: list[tuple[float, dict]], limit: int) -> list[tuple[float, dict]]:
-    wanted = _wanted_categories(query)
+def _diversify_categories(
+    query: str | SearchContext,
+    scored: list[tuple[float, dict]],
+    limit: int,
+) -> list[tuple[float, dict]]:
+    context = _coerce_search_context(query)
+    wanted = list(context.wanted_categories)
     if not wanted:
         return scored
 
@@ -782,6 +1002,12 @@ def _wanted_categories(query: str) -> list[str]:
         if any(keyword in query_lower for keyword in keywords):
             wanted.append(category)
     return wanted
+
+
+def _coerce_search_context(query: str | SearchContext) -> SearchContext:
+    if isinstance(query, SearchContext):
+        return query
+    return _search_context(query)
 
 
 def _iso(value: object) -> str | None:

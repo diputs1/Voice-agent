@@ -29,6 +29,15 @@ export async function fetchScribeToken(): Promise<string> {
   return data.token;
 }
 
+export async function fetchVoiceAgentToken(): Promise<string> {
+  const response = await fetch(`${API_BASE_URL}/voice/agent-token`, { method: "POST" });
+  if (!response.ok) {
+    throw new Error(await response.text());
+  }
+  const data = (await response.json()) as { token: string };
+  return data.token;
+}
+
 export async function playTTS(text: string): Promise<void> {
   const response = await fetch(`${API_BASE_URL}/voice/tts`, {
     method: "POST",
