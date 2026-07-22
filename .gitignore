@@ -33,3 +33,4 @@ pnpm-debug.log*
 .DS_Store
 .vscode/
 .idea/
+backend/app/evals/reports/

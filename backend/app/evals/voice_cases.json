@@ -1,0 +1,82 @@
+[
+  {
+    "id": "schedule_basic",
+    "description": "Stable factual opening-hours question must be grounded by the backend tool.",
+    "turns": ["Vinpearl Safari mở cửa mấy giờ?"],
+    "requires_tool_call": true,
+    "expected_tool": "search_vinpearl_safari_knowledge",
+    "site_id": "default",
+    "limit": 3,
+    "expected_context_substrings": ["09:00", "16:00"],
+    "expected_answer_substrings": ["09:00", "16:00"],
+    "forbidden_answer_substrings": ["08:00"],
+    "max_tool_latency_ms": 1500,
+    "elevenlabs_test_ids": []
+  },
+  {
+    "id": "price_time_sensitive",
+    "description": "Time-sensitive pricing questions must retrieve context but avoid invented prices.",
+    "turns": ["Giá vé hôm nay bao nhiêu?"],
+    "requires_tool_call": true,
+    "expected_tool": "search_vinpearl_safari_knowledge",
+    "site_id": "default",
+    "limit": 3,
+    "expected_context_substrings": ["giá"],
+    "expected_answer_substrings": ["kiểm tra"],
+    "forbidden_answer_substrings": ["chắc chắn là", "đang áp dụng là"],
+    "time_sensitive": true,
+    "max_tool_latency_ms": 1500,
+    "elevenlabs_test_ids": []
+  },
+  {
+    "id": "small_talk_no_tool",
+    "description": "Greeting should be handled by the ElevenLabs agent without the factual search tool.",
+    "turns": ["Xin chào"],
+    "requires_tool_call": false,
+    "expected_tool": null,
+    "expected_answer_substrings": ["Vinpearl Safari Phú Quốc"],
+    "forbidden_answer_substrings": [],
+    "elevenlabs_test_ids": []
+  },
+  {
+    "id": "out_of_scope_no_tool",
+    "description": "Out-of-domain user request should not be answered as Safari fact.",
+    "turns": ["Thời tiết Hà Nội hôm nay thế nào?"],
+    "requires_tool_call": false,
+    "expected_tool": null,
+    "expected_answer_substrings": ["chỉ hỗ trợ"],
+    "forbidden_answer_substrings": ["nhiệt độ hiện tại"],
+    "elevenlabs_test_ids": []
+  },
+  {
+    "id": "products_basic",
+    "description": "Product/service question must retrieve Safari product context.",
+    "turns": ["Các sản phẩm của VinSafari Phú Quốc có gì?"],
+    "requires_tool_call": true,
+    "expected_tool": "search_vinpearl_safari_knowledge",
+    "site_id": "default",
+    "limit": 3,
+    "expected_context_substrings": ["Kid Zoo"],
+    "expected_answer_substrings": ["sản phẩm"],
+    "forbidden_answer_substrings": ["không có thông tin"],
+    "max_tool_latency_ms": 1500,
+    "elevenlabs_test_ids": []
+  },
+  {
+    "id": "follow_up_price_child",
+    "description": "Multi-turn follow-up should rewrite the second search query with prior context.",
+    "turns": ["Giá vé người lớn?", "còn trẻ em thì sao?"],
+    "requires_tool_call": true,
+    "expected_tool": "search_vinpearl_safari_knowledge",
+    "site_id": "default",
+    "limit": 3,
+    "expected_context_substrings": ["giá"],
+    "expected_rewrite_source": "voice_memory_heuristic",
+    "expected_resolved_query_substrings": ["Giá vé người lớn?", "còn trẻ em thì sao?"],
+    "expected_answer_substrings": ["kiểm tra"],
+    "forbidden_answer_substrings": ["chắc chắn là"],
+    "time_sensitive": true,
+    "max_tool_latency_ms": 1500,
+    "elevenlabs_test_ids": []
+  }
+]

@@ -27,7 +27,7 @@ class TTSRequest(BaseModel):
 class VoiceAgentKnowledgeRequest(BaseModel):
     query: str = Field(min_length=1, max_length=1000)
     site_id: str | None = None
-    limit: int = Field(default=5, ge=1, le=10)
+    limit: int = Field(default=3, ge=1, le=10)
     conversation_id: str | None = None
     turn_id: str | None = None
     request_id: str | None = None
@@ -40,6 +40,8 @@ class VoiceAgentKnowledgeRequest(BaseModel):
         if value is None:
             return None
         normalized = str(value).strip()
+        if normalized.lower() == "default":
+            return None
         return normalized or None
 
     @model_validator(mode="before")
@@ -78,6 +80,11 @@ class VoiceAgentTraceMetadata(BaseModel):
     latency_ms: float
     hit_count: int
     top_score: float | None = None
+    context_byte_count: int = 0
+    context_char_count: int = 0
+    cache_hit: bool = False
+    rewrite_source: str | None = None
+    resolved_query: str | None = None
 
 
 class VoiceAgentKnowledgeResponse(BaseModel):

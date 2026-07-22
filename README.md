@@ -201,6 +201,13 @@ ELEVENLABS_API_KEY=...
 ELEVENLABS_AGENT_ID=agent_...
 ELEVENLABS_WEBHOOK_SECRET=choose-a-shared-secret
 ELEVENLABS_LOG_RAW_TOOL_PAYLOAD=false
+VOICE_AGENT_TOKEN_RATE_LIMIT_PER_MINUTE=30
+VOICE_TOOL_RATE_LIMIT_PER_MINUTE=240
+VOICE_RATE_LIMIT_WINDOW_SECONDS=60
+VOICE_TOOL_CACHE_TTL_SECONDS=300
+VOICE_TOOL_CACHE_MAX_ENTRIES=512
+VOICE_MEMORY_TTL_SECONDS=1800
+VOICE_MEMORY_MAX_CONVERSATIONS=1000
 ```
 
 `AGENT_MAX_CONCURRENCY` limits concurrent `/chat/stream` agent runs per backend process. QA cache keys use the contextualized query plus the current KB document-set hash, so cached answers expire by TTL and naturally miss after ingestion changes the KB.
@@ -214,6 +221,7 @@ POST /voice/agent-token
 ```
 
 The backend uses `ELEVENLABS_API_KEY` and `ELEVENLABS_AGENT_ID` to request a temporary conversation token from ElevenLabs. The API key is never exposed to the browser.
+In production, `ELEVENLABS_WEBHOOK_SECRET` is required; missing webhook auth fails closed instead of exposing the tool endpoint.
 
 Configure a webhook tool in the ElevenLabs Agent dashboard:
 
@@ -226,10 +234,10 @@ Headers:
 Body parameters:
   query   string, required, the user's factual Vinpearl Safari question
   site_id string, optional, use "default" unless you route multiple sites
-  limit   integer, optional, default 5
+  limit   integer, optional, default 3 for voice latency
 ```
 
-The endpoint accepts both direct JSON bodies such as `{"query":"...","site_id":"default","limit":5}` and ElevenLabs-style wrapped tool payloads such as `{"conversation_id":"...","parameters":{"query":"..."}}`.
+The endpoint accepts both direct JSON bodies such as `{"query":"...","site_id":"default","limit":3}` and ElevenLabs-style wrapped tool payloads such as `{"conversation_id":"...","parameters":{"query":"..."}}`.
 It also accepts optional `correlation_id`, `turn_id`, `request_id`, or `tool_call_id` fields.
 If none is provided, the backend generates a `correlation_id` and returns it with the tool
 response so LangSmith runs can be matched with ElevenLabs conversation logs.
@@ -251,7 +259,7 @@ Với chào hỏi, cảm ơn, hoặc hội thoại xã giao, có thể trả l�
 Trả lời ngắn gọn, tự nhiên, phù hợp hội thoại bằng giọng nói.
 ```
 
-The webhook response contains `context` hits with `content`, `source_url`, `title`, `section`, `category`, `score`, and metadata. It also includes `correlation_id`, `turn_id`, and a `trace` object with receive/complete timestamps, backend latency, hit count, and top score. The backend does not generate the final voice answer on this path; ElevenLabs Agent does.
+The webhook response contains `context` hits with `content`, `source_url`, `title`, `section`, `category`, `score`, and metadata. It also includes `correlation_id`, `turn_id`, and a `trace` object with receive/complete timestamps, backend latency, hit count, top score, cache hit status, rewrite source, and context payload size. The backend does not generate the final voice answer on this path; ElevenLabs Agent does.
 
 `ELEVENLABS_LOG_RAW_TOOL_PAYLOAD=true` logs the raw incoming tool payload at the webhook
 boundary for short debugging windows. Keep it off in normal production traffic unless your
@@ -290,3 +298,58 @@ Run the local seed-KB eval suite without external services:
 cd backend
 python -m app.evals.run_eval --graph compare --runs 3
 ```
+
+Run the same checks against a real ElevenLabs Voice Agent conversation transcript:
+
+```bash
+cd backend
+ELEVENLABS_API_KEY=... python -m app.evals.run_eval --voice-conversation-id conv_xxx
+```
+
+Or evaluate a saved `GET /v1/convai/conversations/:conversation_id` JSON response:
+
+```bash
+cd backend
+python -m app.evals.run_eval --voice-conversation-file ./conversation.json
+```
+
+Voice transcript eval matches each `cases.json` question to a user turn and checks the
+following agent answer for required substrings. Internal LangGraph checks such as intent,
+handoff, and citations are reported as skipped because ElevenLabs generates the final voice
+answer outside the backend webhook path.
+
+
+### Voice-agent harness loop
+
+Run the deterministic backend voice-tool harness without external services:
+
+```bash
+cd backend
+python -m app.evals.run_voice_loop --mode local
+```
+
+Generate the local manifest for ElevenLabs Agent Testing setup. Use it to create
+Tool Call, Next Reply, and Simulation tests in ElevenLabs, then copy the created
+IDs into `backend/app/evals/voice_cases.json` or pass them with `--test-id`:
+
+```bash
+cd backend
+python -m app.evals.run_voice_loop --mode manifest
+```
+
+Run native ElevenLabs Agent Testing against existing test IDs:
+
+```bash
+cd backend
+ELEVENLABS_API_KEY=... ELEVENLABS_AGENT_ID=... \
+  python -m app.evals.run_voice_loop --mode elevenlabs --test-id test_xxx --repeat-count 5
+```
+
+The local harness reports retrieval latency, hit counts, cache/rewrite state, and
+context substring checks. The ElevenLabs runner uses the official
+`POST /v1/convai/agents/:agent_id/run-tests` API and normalizes tool calls, tool
+results, tool latency, condition results, and bucketing metadata into JSON
+reports under `backend/app/evals/reports/voice/`.
+
+`site_id=default` is treated as unscoped default retrieval by the backend. Use a
+real site ID only after ingestion has populated rows for that site.
