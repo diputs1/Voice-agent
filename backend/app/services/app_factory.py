@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import logging
 
+import httpx
 from fastapi import FastAPI
 from psycopg_pool import AsyncConnectionPool
 
@@ -15,6 +16,8 @@ from app.knowledge.embeddings import EmbeddingProvider
 from app.crawling.firecrawl import FirecrawlClient
 from app.knowledge.kb import InMemoryKnowledgeBase, KnowledgeBase, PostgresKnowledgeBase
 from app.core.observability import configure_langsmith
+from app.core.rate_limit import InMemoryRateLimiter
+from app.core.voice_memory import VoiceConversationMemory
 from app.services.chat_service import ChatService
 from app.services.ingestion_service import IngestionService
 
@@ -25,6 +28,16 @@ async def initialize_app_state(app: FastAPI, settings: Settings) -> None:
     app.state.settings = settings
     app.state.langsmith_status = configure_langsmith(settings)
     app.state.kb_status = {"provider": "unknown", "fallback": False, "fallback_reason": None}
+    app.state.http_client = httpx.AsyncClient(timeout=60.0)
+    app.state.voice_rate_limiter = InMemoryRateLimiter()
+    app.state.voice_tool_cache = TTLQACache(
+        ttl_seconds=settings.voice_tool_cache_ttl_seconds,
+        max_entries=settings.voice_tool_cache_max_entries,
+    )
+    app.state.voice_conversation_memory = VoiceConversationMemory(
+        ttl_seconds=settings.voice_memory_ttl_seconds,
+        max_conversations=settings.voice_memory_max_conversations,
+    )
     app.state.kb = await build_knowledge_base(app, settings)
     app.state.crawl_job_store = await build_crawl_job_store(app, settings)
     app.state.agent_config = AgentConfig.from_settings(settings)
@@ -58,6 +71,9 @@ async def initialize_app_state(app: FastAPI, settings: Settings) -> None:
 
 
 async def shutdown_app_state(app: FastAPI) -> None:
+    http_client = getattr(app.state, "http_client", None)
+    if http_client:
+        await http_client.aclose()
     pool = getattr(app.state, "database_pool", None)
     if pool:
         await pool.close()

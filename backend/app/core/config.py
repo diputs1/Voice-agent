@@ -24,6 +24,13 @@ class Settings(BaseSettings):
     elevenlabs_voice_id: str = "JBFqnCBsd6RMkjVDRZzb"
     elevenlabs_tts_model: str = "eleven_flash_v2_5"
     elevenlabs_tts_language_code: str = "vi"
+    voice_agent_token_rate_limit_per_minute: int = Field(default=30, ge=0)
+    voice_tool_rate_limit_per_minute: int = Field(default=240, ge=0)
+    voice_rate_limit_window_seconds: int = Field(default=60, ge=1)
+    voice_tool_cache_ttl_seconds: int = Field(default=300, ge=0)
+    voice_tool_cache_max_entries: int = Field(default=512, ge=1)
+    voice_memory_ttl_seconds: int = Field(default=1800, ge=0)
+    voice_memory_max_conversations: int = Field(default=1000, ge=1)
     vinwonders_source_url: str = "https://vinwonders.com/vi/vinpearl-safari-phu-quoc/"
     cors_origins: str = Field(default="http://localhost:3000")
     low_confidence_threshold: float = Field(default=0.70, ge=0.0, le=1.0)

@@ -8,6 +8,8 @@ from fastapi import HTTPException
 
 from app import main
 from app.core.cache import TTLQACache
+from app.core.rate_limit import InMemoryRateLimiter
+from app.core.voice_memory import VoiceConversationMemory
 from app.routers import admin, chat, health
 from app.api.schemas import CrawlRequest, TTSRequest, VoiceAgentKnowledgeRequest
 from app.knowledge.kb import KnowledgeHit
@@ -326,8 +328,63 @@ async def test_search_voice_agent_knowledge_returns_kb_hits():
     assert response.trace is not None
     assert response.trace.hit_count == 1
     assert response.trace.top_score == 0.92
+    assert response.trace.cache_hit is False
+    assert response.trace.rewrite_source == "original"
     assert response.context[0].content == "Vinpearl Safari mở cửa từ 09:00 đến 16:00."
     assert response.context[0].source_url == "https://vinwonders.com/safari"
+
+
+@pytest.mark.asyncio
+async def test_search_voice_agent_knowledge_uses_voice_tool_cache():
+    kb = FakeKnowledgeBase()
+    main.app.state.kb = kb
+    main.app.state.voice_tool_cache = TTLQACache(ttl_seconds=60, max_entries=10)
+    main.app.state.voice_conversation_memory = None
+    main.app.state.settings = SimpleNamespace(elevenlabs_webhook_secret="secret")
+
+    payload = VoiceAgentKnowledgeRequest(query="Safari mở cửa mấy giờ?", site_id="vinwonders")
+    first = await chat.search_voice_agent_knowledge(_request(), payload, authorization="Bearer secret")
+    second = await chat.search_voice_agent_knowledge(_request(), payload, authorization="Bearer secret")
+
+    assert kb.search_calls == [("Safari mở cửa mấy giờ?", 3, "vinwonders")]
+    assert first.trace.cache_hit is False
+    assert second.trace.cache_hit is True
+    assert second.context[0].content == "Vinpearl Safari mở cửa từ 09:00 đến 16:00."
+
+
+@pytest.mark.asyncio
+async def test_search_voice_agent_knowledge_rewrites_follow_up_from_voice_memory():
+    kb = FakeKnowledgeBase()
+    main.app.state.kb = kb
+    main.app.state.voice_tool_cache = None
+    main.app.state.voice_conversation_memory = VoiceConversationMemory(
+        ttl_seconds=60,
+        max_conversations=10,
+    )
+    main.app.state.settings = SimpleNamespace(elevenlabs_webhook_secret="secret")
+
+    first = VoiceAgentKnowledgeRequest(
+        query="Giá vé người lớn?",
+        site_id="vinwonders",
+        conversation_id="conv_1",
+    )
+    follow_up = VoiceAgentKnowledgeRequest(
+        query="còn trẻ em thì sao?",
+        site_id="vinwonders",
+        conversation_id="conv_1",
+    )
+
+    await chat.search_voice_agent_knowledge(_request(), first, authorization="Bearer secret")
+    response = await chat.search_voice_agent_knowledge(_request(), follow_up, authorization="Bearer secret")
+
+    assert kb.search_calls[1] == (
+        "Giá vé người lớn?. Câu hỏi tiếp theo: còn trẻ em thì sao?",
+        3,
+        "vinwonders",
+    )
+    assert response.query == "còn trẻ em thì sao?"
+    assert response.trace.rewrite_source == "voice_memory_heuristic"
+    assert response.trace.resolved_query == "Giá vé người lớn?. Câu hỏi tiếp theo: còn trẻ em thì sao?"
 
 
 def test_voice_agent_knowledge_request_accepts_elevenlabs_parameters_payload():
@@ -365,6 +422,63 @@ async def test_search_voice_agent_knowledge_rejects_invalid_secret():
         )
 
     assert exc.value.status_code == 401
+
+
+@pytest.mark.asyncio
+async def test_search_voice_agent_knowledge_requires_secret_outside_dev():
+    main.app.state.kb = FakeKnowledgeBase()
+    main.app.state.settings = SimpleNamespace(elevenlabs_webhook_secret=None, app_env="production")
+
+    with pytest.raises(HTTPException) as exc:
+        await chat.search_voice_agent_knowledge(
+            _request(),
+            VoiceAgentKnowledgeRequest(query="Giá vé?"),
+        )
+
+    assert exc.value.status_code == 500
+    assert "ELEVENLABS_WEBHOOK_SECRET" in exc.value.detail
+
+
+@pytest.mark.asyncio
+async def test_create_voice_agent_token_rate_limits_requests(monkeypatch):
+    sent_requests = []
+    main.app.state.voice_rate_limiter = InMemoryRateLimiter()
+    main.app.state.settings = SimpleNamespace(
+        elevenlabs_api_key="test-key",
+        elevenlabs_agent_id="agent_test",
+        elevenlabs_agent_environment=None,
+        voice_agent_token_rate_limit_per_minute=1,
+        voice_rate_limit_window_seconds=60,
+    )
+
+    class FakeTokenResponse:
+        status_code = 200
+
+        def json(self):
+            return {"token": "conversation-token"}
+
+    class FakeAsyncClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, traceback):
+            return None
+
+        async def get(self, url, *, headers, params):
+            sent_requests.append({"url": url, "headers": headers, "params": params})
+            return FakeTokenResponse()
+
+    monkeypatch.setattr(chat.httpx, "AsyncClient", FakeAsyncClient)
+
+    assert await chat.create_voice_agent_token(_request()) == {"token": "conversation-token"}
+    with pytest.raises(HTTPException) as exc:
+        await chat.create_voice_agent_token(_request())
+
+    assert exc.value.status_code == 429
+    assert len(sent_requests) == 1
 
 
 class FakeCrawlJobStore:
